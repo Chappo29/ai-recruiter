@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
 from sqlalchemy import select
 
 from app.core.auth import create_access_token, get_password_hash, verify_password
+from app.core.rate_limit import auth_login_limit, auth_register_limit
 from app.deps import CurrentUser, DbSession
 from app.models import Agency, User
 from app.schemas.auth import AuthMeResponse, LoginRequest, RegisterRequest, TokenResponse
@@ -11,7 +12,8 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def register(body: RegisterRequest, db: DbSession) -> User:
+@auth_register_limit()
+async def register(request: Request, body: RegisterRequest, db: DbSession) -> User:
     existing = await db.execute(select(User).where(User.email == body.email))
     if existing.scalar_one_or_none() is not None:
         raise HTTPException(
@@ -36,7 +38,8 @@ async def register(body: RegisterRequest, db: DbSession) -> User:
 
 
 @router.post("/login", response_model=TokenResponse)
-async def login(body: LoginRequest, db: DbSession) -> TokenResponse:
+@auth_login_limit()
+async def login(request: Request, body: LoginRequest, db: DbSession) -> TokenResponse:
     result = await db.execute(select(User).where(User.email == body.email))
     user = result.scalar_one_or_none()
     if user is None or not verify_password(body.password, user.password_hash):

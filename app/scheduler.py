@@ -8,7 +8,7 @@ from sqlalchemy import select, update as sa_update
 
 from app.database import async_session_factory
 from app.models import CandidateReminder, Screening
-from bot import manager as bot_manager
+from bot.outbound import send_message
 
 logger = logging.getLogger(__name__)
 
@@ -44,13 +44,15 @@ _MSG_B_24H = (
 async def _send(agency_id: str, telegram_id: str, text: str) -> bool:
     """Send a Telegram message; return True on success."""
     try:
-        await bot_manager.send_message(agency_id, telegram_id, text)
+        async with async_session_factory() as db:
+            await send_message(db, agency_id, telegram_id, text)
         return True
-    except RuntimeError:
+    except RuntimeError as exc:
         logger.warning(
-            "Bot not running for agency %s — skipping reminder to %s",
+            "Cannot send reminder agency=%s telegram_id=%s: %s",
             agency_id,
             telegram_id,
+            exc,
         )
         return False
     except Exception:

@@ -1,10 +1,11 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 
 from app.core.config import get_internal_api_key
+from app.core.rate_limit import internal_limit
 from app.deps import CurrentUser, DbSession
 from app.models import CandidateAnswer, Question, Screening, Vacancy
 from app.schemas.question import (
@@ -144,7 +145,9 @@ async def delete_question(
     "/questions/vacancy/{vacancy_id}",
     response_model=list[QuestionResponse],
 )
+@internal_limit()
 async def list_questions_internal(
+    request: Request,
     vacancy_id: UUID,
     db: DbSession,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
@@ -168,7 +171,9 @@ async def list_questions_internal(
     response_model=AnswerResponse,
     status_code=status.HTTP_201_CREATED,
 )
+@internal_limit()
 async def save_answer_internal(
+    request: Request,
     body: AnswerCreate,
     db: DbSession,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
@@ -227,7 +232,9 @@ async def save_answer_internal(
     "/answers/screening/{screening_id}",
     response_model=list[AnswerResponse],
 )
+@internal_limit()
 async def list_answers_for_screening_internal(
+    request: Request,
     screening_id: UUID,
     db: DbSession,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),

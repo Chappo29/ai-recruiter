@@ -14,7 +14,8 @@ from app.schemas.bots import (
     BotStatusResponse,
     BotTokenResponse,
 )
-from bot import manager as bot_manager
+from app.services import bot_runtime_service
+from app.services.bot_worker_client import BotWorkerError, start_bot, stop_bot
 
 router = APIRouter(prefix="/bots", tags=["bots"])
 logger = logging.getLogger(__name__)
@@ -84,8 +85,14 @@ async def start_agency_bot(
         ) from None
 
     agency_id = str(current_user.agency_id)
-    await bot_manager.stop_bot(agency_id)
-    await bot_manager.start_bot(agency_id, token, BACKEND_URL)
+    try:
+        await stop_bot(agency_id)
+        await start_bot(agency_id, token, BACKEND_URL)
+    except BotWorkerError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Bot worker unavailable: {exc}. Запустите: python -m bot",
+        ) from exc
 
     return BotActionResponse(status="started")
 
@@ -97,7 +104,13 @@ async def stop_agency_bot(
 ) -> BotActionResponse:
     await _get_agency(db, current_user.agency_id)
     agency_id = str(current_user.agency_id)
-    await bot_manager.stop_bot(agency_id)
+    try:
+        await stop_bot(agency_id)
+    except BotWorkerError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Bot worker unavailable: {exc}",
+        ) from exc
     return BotActionResponse(status="stopped")
 
 
@@ -107,16 +120,10 @@ async def get_agency_bot_status(
     current_user: CurrentUser,
 ) -> BotStatusResponse:
     agency = await _get_agency(db, current_user.agency_id)
-    agency_id = str(current_user.agency_id)
-    is_running = agency_id in bot_manager.running_bots
-    bot_username: str | None = None
-    if is_running:
-        application = bot_manager.running_bots[agency_id]
-        try:
-            me = await application.bot.get_me()
-            bot_username = me.username
-        except Exception:
-            logger.exception("Failed to fetch bot username for agency %s", agency_id)
+    agency_id = current_user.agency_id
+    is_running = await bot_runtime_service.is_runtime_alive(db, agency_id)
+    runtime = await bot_runtime_service.get_runtime(db, agency_id)
+    bot_username = runtime.bot_username if runtime else None
 
     return BotStatusResponse(
         status="running" if is_running else "stopped",

@@ -2,3 +2,5 @@
 .venv/
 __pycache__/
 *.pyc
+media/resumes/*.pdf
+uvicorn-test*.log

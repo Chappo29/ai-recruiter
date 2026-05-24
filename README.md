@@ -81,7 +81,21 @@ Open http://127.0.0.1:8000/docs for interactive API docs.
 
 Protected routes need `Authorization: Bearer <access_token>` from `POST /auth/login`.
 
-### 6. Inspect tables without local `psql`
+### 6. Bot worker (Telegram polling)
+
+API and bot polling run in **separate processes**. FastAPI can use multiple workers; the bot worker must be a **single** instance.
+
+```powershell
+# Terminal 2 — same .env / DATABASE_URL / SECRET_KEY / INTERNAL_API_KEY
+python -m bot
+```
+
+Control API: http://127.0.0.1:8001/health  
+Start/stop bots from the web panel (`POST /bots/start`) calls this worker.
+
+Outbound messages (reject, reminders) use the Telegram HTTP API with the token from the database — they work from any API worker without polling.
+
+### 7. Inspect tables without local `psql`
 
 **Docker exec:**
 
@@ -107,6 +121,8 @@ docker exec -it recruiter-db psql -U postgres -d recruiter -c "SELECT tablename 
 | `venv\Scripts\activate` not found | Folder is `.venv` — run `.\.venv\Scripts\Activate.ps1` |
 | `lxml` build failed on Python 3.13 | Use `lxml>=5.3` from requirements (prebuilt wheel); parser falls back to `html.parser` if lxml missing |
 | Auth / connection string errors with special password | URL-encode password with `urllib.parse.quote_plus` |
+| `Bot worker unavailable` on start/stop | Run `python -m bot` in a second terminal |
+| Reminders not sent | Set `telegram_bot_token` in DB; token is loaded per `agency_id` |
 
 Stop database:
 

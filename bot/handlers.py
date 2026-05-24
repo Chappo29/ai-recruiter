@@ -1,11 +1,8 @@
 """Telegram bot conversation handlers for candidate dialog."""
 
-import base64
-import io
 import logging
 
 import httpx
-from pypdf import PdfReader
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     CallbackQueryHandler,
@@ -17,7 +14,14 @@ from telegram.ext import (
 )
 
 from app.core.config import get_internal_api_key
-from app.services.llm_service import extract_candidate_name_from_resume
+from bot.resume_pipeline import (
+    ResumeInput,
+    _MSG_DOCX_STUB,
+    _MSG_PROCESSING_ACK,
+    _MSG_PROCESSING_BUSY,
+    run_resume_pipeline,
+    schedule_resume_pipeline,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,15 +35,13 @@ _MSG_WRONG_DOC = (
     "Попробуйте ещё раз 👆"
 )
 
-_MSG_TEXT_INSTEAD_PDF = (
-    "📄 Пожалуйста, отправьте файл PDF, а не текст.\n\n"
-    "Как скачать с hh.ru:\n"
-    "1. Зайдите на hh.ru → Моё резюме\n"
-    "2. Нажмите «Скачать» → PDF\n"
-    "Попробуйте ещё раз 👆"
+_MSG_NEED_RESUME = (
+    "📄 Отправьте резюме:\n"
+    "• PDF-файл (скачать с hh.ru → «Скачать» → PDF)\n"
+    "• или текстом — ссылка на hh.ru или кратко об опыте"
 )
 
-_MSG_NEED_PDF = "📄 Нужен PDF файл резюме.\nПопробуйте ещё раз 👆"
+_MIN_TEXT_RESUME_LEN = 30
 
 
 def _headers() -> dict[str, str]:
@@ -58,11 +60,11 @@ def _vacancy_chosen_message(title: str, company: str | None) -> str:
         [
             "",
             f"Для участия в отборе на позицию {title}",
-            "отправьте резюме в формате PDF.",
+            "отправьте резюме PDF или текстом (ссылка hh.ru / описание опыта).",
             "",
-            "Как скачать с hh.ru:",
+            "PDF с hh.ru:",
             "1. Зайдите на hh.ru → Моё резюме",
-            "2. Нажмите «Скачать» → PDF",
+            "2. «Скачать» → PDF",
             "3. Отправьте файл сюда ⬆️",
         ]
     )
@@ -177,10 +179,6 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
 
         return WAIT_RESUME
 
-    def _extract_pdf_text_from_bytes(file_bytes: bytes) -> str:
-        reader = PdfReader(io.BytesIO(file_bytes))
-        return "\n".join(page.extract_text() or "" for page in reader.pages)
-
     async def _create_screening(
         vacancy_id: str, candidate_id: str, *, run_llm: bool = True
     ) -> str | None:
@@ -286,9 +284,28 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
 
     async def handle_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         message = update.message
+        ud = ctx.user_data
+
+        if ud.get("awaiting_questions"):
+            return await handle_answer(update, ctx)
+
+        if ud.get("conversation_finished"):
+            await message.reply_text(
+                "Ваш отклик уже принят. Нажмите /start, чтобы откликнуться снова."
+            )
+            return ConversationHandler.END
+
+        if ud.get("processing_resume"):
+            await message.reply_text(_MSG_PROCESSING_BUSY)
+            return WAIT_RESUME
+
+        resume_input: ResumeInput | None = None
 
         if message.document:
             file_name = (message.document.file_name or "").lower()
+            if file_name.endswith(".docx") or file_name.endswith(".doc"):
+                await message.reply_text(_MSG_DOCX_STUB)
+                return WAIT_RESUME
             if not file_name.endswith(".pdf"):
                 await message.reply_text(_MSG_WRONG_DOC)
                 return WAIT_RESUME
@@ -297,117 +314,63 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
             try:
                 tg_file = await doc.get_file()
                 file_bytes = bytes(await tg_file.download_as_bytearray())
-                resume_text = _extract_pdf_text_from_bytes(file_bytes)
             except Exception:
-                logger.exception("PDF extraction failed")
+                logger.exception("PDF download failed")
                 await message.reply_text(
-                    "Не удалось прочитать PDF. Попробуйте другой файл."
+                    "Не удалось скачать файл. Попробуйте ещё раз."
                 )
                 return WAIT_RESUME
 
-            if not resume_text or not resume_text.strip():
-                await message.reply_text(
-                    "Не удалось извлечь текст из PDF. Попробуйте другой файл."
-                )
-                return WAIT_RESUME
+            resume_input = ResumeInput(
+                kind="pdf",
+                file_bytes=file_bytes,
+                filename=doc.file_name or "resume.pdf",
+            )
 
         elif message.text:
-            await message.reply_text(_MSG_TEXT_INSTEAD_PDF)
-            return WAIT_RESUME
+            text = message.text.strip()
+            if len(text) < _MIN_TEXT_RESUME_LEN and "hh.ru" not in text.lower():
+                await message.reply_text(
+                    "Пожалуйста, отправьте чуть подробнее: ссылку на hh.ru "
+                    "или краткое описание опыта (не менее нескольких предложений)."
+                )
+                return WAIT_RESUME
+            resume_input = ResumeInput(kind="text", resume_text=text)
 
         else:
-            await message.reply_text(_MSG_NEED_PDF)
+            await message.reply_text(_MSG_NEED_RESUME)
             return WAIT_RESUME
 
-        try:
-            name_data = await extract_candidate_name_from_resume(resume_text)
-        except Exception:
-            logger.exception("Failed to extract name via LLM")
-            name_data = {
-                "first_name": "Кандидат",
-                "last_name": "",
-                "full_name": "Кандидат",
-            }
+        await message.reply_text(_MSG_PROCESSING_ACK)
+        ud["processing_resume"] = True
+        ud["awaiting_questions"] = False
+        ud["conversation_finished"] = False
 
-        ctx.user_data["first_name"] = name_data["first_name"]
-        ctx.user_data["full_name"] = name_data["full_name"]
-        ctx.user_data["resume_text"] = resume_text
+        chat_id = update.effective_chat.id
+        bot = ctx.application.bot
 
-        telegram_id = str(update.effective_user.id)
-        vacancy_id = ctx.user_data["vacancy_id"]
-
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            cand_response = await _api_post(
-                client,
-                "/internal/candidates/",
-                {
-                    "full_name": name_data["full_name"],
-                    "telegram_id": telegram_id,
-                    "resume_text": resume_text,
-                },
+        async def _pipeline() -> None:
+            await run_resume_pipeline(
+                bot=bot,
+                chat_id=chat_id,
+                ctx=ctx,
+                agency_id=agency_id,
+                backend=backend,
+                headers=_headers(),
+                resume_input=resume_input,
+                api_post=_api_post,
+                load_questions=_load_questions,
+                create_screening=_create_screening,
+                complete_screening=_complete_screening,
+                cancel_reminder=_cancel_reminder,
+                create_reminder=_create_reminder,
+                first_question_message=_first_question_message,
+                next_question_message=_next_question_message,
+                final_message=_final_message,
             )
 
-        if cand_response.status_code not in (200, 201):
-            await message.reply_text(
-                "Не удалось сохранить данные. Попробуйте позже."
-            )
-            return WAIT_RESUME
-
-        candidate_id = cand_response.json()["id"]
-        ctx.user_data["candidate_id"] = candidate_id
-
-        file_b64 = base64.b64encode(file_bytes).decode()
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            upload_resp = await _api_post(
-                client,
-                "/internal/candidates/upload-resume",
-                {
-                    "candidate_id": candidate_id,
-                    "file_base64": file_b64,
-                    "filename": doc.file_name or "resume.pdf",
-                },
-            )
-        if upload_resp.status_code not in (200, 201):
-            logger.warning(
-                "Resume PDF upload failed: %s %s",
-                upload_resp.status_code,
-                upload_resp.text,
-            )
-
-        questions = await _load_questions(vacancy_id)
-        ctx.user_data["questions"] = questions
-        ctx.user_data["answers"] = []
-        ctx.user_data["question_index"] = 0
-
-        # Cancel State A reminder — resume has been received
-        await _cancel_reminder(telegram_id)
-
-        if not questions:
-            screening_id = await _create_screening(
-                vacancy_id, candidate_id, run_llm=True
-            )
-            if screening_id:
-                ctx.user_data["screening_id"] = screening_id
-            else:
-                logger.warning("Screening id missing after resume")
-            return await _send_final_message(update, ctx, had_questions=False)
-
-        screening_id = await _create_screening(
-            vacancy_id, candidate_id, run_llm=False
-        )
-        if screening_id:
-            ctx.user_data["screening_id"] = screening_id
-            # State B: resume received, now waiting for question answers
-            await _create_reminder(
-                telegram_id=telegram_id,
-                state="waiting_answers",
-                vacancy_title=ctx.user_data.get("vacancy_title", ""),
-                screening_id=screening_id,
-            )
-        else:
-            logger.warning("Screening id missing; answers may not be saved")
-
-        return await _ask_current_question(update, ctx)
+        schedule_resume_pipeline(bot=bot, chat_id=chat_id, ctx=ctx, coro_factory=_pipeline)
+        return WAIT_RESUME
 
     async def handle_answer(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         answer_text = (update.message.text or "").strip()
@@ -451,8 +414,9 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
         if screening_id:
             await _complete_screening(screening_id)
 
-        # All questions answered — cancel State B reminder
         await _cancel_reminder(str(update.effective_user.id))
+        ctx.user_data["awaiting_questions"] = False
+        ctx.user_data["conversation_finished"] = True
 
         return await _send_final_message(update, ctx, had_questions=True)
 

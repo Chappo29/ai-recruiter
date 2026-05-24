@@ -3,11 +3,12 @@ import uuid
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, status
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 
 from app.core.config import get_internal_api_key
+from app.core.rate_limit import internal_limit
 from app.database import async_session_factory
 from app.deps import CurrentUser, DbSession
 from app.models import CandidateAnswer, Screening, Vacancy
@@ -22,7 +23,7 @@ from app.schemas.screening import (
 from app.services import screening_service
 from app.utils.display_verdict import display_verdict_for
 from app.utils.screening_response import compute_screening_indices, to_screening_response
-from bot import manager as bot_manager
+from bot.outbound import send_rejection
 
 router = APIRouter(prefix="/screenings", tags=["screenings"])
 internal_router = APIRouter(prefix="/internal", tags=["internal"])
@@ -81,7 +82,9 @@ async def start_screening(
 
 
 @internal_router.post("/screenings/", response_model=ScreeningResponse)
+@internal_limit()
 async def create_screening_internal(
+    request: Request,
     body: dict[str, Any],
     db: DbSession,
     background_tasks: BackgroundTasks,
@@ -124,7 +127,9 @@ async def create_screening_internal(
 
 
 @internal_router.post("/screenings/{screening_id}/complete")
+@internal_limit()
 async def complete_screening_internal(
+    request: Request,
     screening_id: UUID,
     background_tasks: BackgroundTasks,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
@@ -381,11 +386,10 @@ async def reject_screening(
 
     full_name = candidate.full_name or "Кандидат"
     candidate_name = full_name.split()[0] if full_name else "Кандидат"
-    agency_id = str(current_user.agency_id)
 
     try:
-        await bot_manager.send_rejection(
-            agency_id, candidate.telegram_id, candidate_name
+        await send_rejection(
+            db, current_user.agency_id, candidate.telegram_id, candidate_name
         )
     except RuntimeError as exc:
         raise HTTPException(

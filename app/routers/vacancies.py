@@ -4,10 +4,11 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, Request, status
 from sqlalchemy import select
 
 from app.core.config import get_internal_api_key
+from app.core.rate_limit import internal_limit
 from app.deps import CurrentUser, DbSession
 from app.models import Agency, Candidate, User, Vacancy
 from app.schemas.candidate import ResumeUploadRequest, ResumeUploadResponse
@@ -64,7 +65,9 @@ async def parse_vacancy_hh(
 
 
 @internal_router.get("/vacancies/", response_model=InternalVacancyListResponse)
+@internal_limit()
 async def list_agency_vacancies_internal(
+    request: Request,
     agency_id: UUID,
     db: DbSession,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
@@ -100,7 +103,9 @@ async def list_agency_vacancies_internal(
 
 
 @internal_router.post("/parse-hh", response_model=ParseVacancyHHResponse)
+@internal_limit()
 async def parse_hh_internal(
+    request: Request,
     body: ParseHHRequest,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
 ) -> ParseVacancyHHResponse:
@@ -110,7 +115,9 @@ async def parse_hh_internal(
 
 
 @internal_router.post("/vacancies/get-or-create")
+@internal_limit()
 async def get_or_create_vacancy_internal(
+    request: Request,
     body: dict[str, Any],
     db: DbSession,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
@@ -170,7 +177,9 @@ async def get_or_create_vacancy_internal(
 
 
 @internal_router.post("/candidates/")
+@internal_limit()
 async def create_candidate_internal(
+    request: Request,
     body: dict[str, Any],
     db: DbSession,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
@@ -216,7 +225,9 @@ async def create_candidate_internal(
     "/candidates/upload-resume",
     response_model=ResumeUploadResponse,
 )
+@internal_limit()
 async def upload_candidate_resume(
+    request: Request,
     body: ResumeUploadRequest,
     db: DbSession,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),

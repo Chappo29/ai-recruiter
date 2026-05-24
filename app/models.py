@@ -241,3 +241,26 @@ class CandidateReminder(Base):
             f"<CandidateReminder id={self.id!s} telegram_id={self.telegram_id!r} "
             f"state={self.state!r} cancelled={self.cancelled}>"
         )
+
+
+class BotRuntime(Base):
+    """Bot-worker heartbeat and status (one row per agency)."""
+
+    __tablename__ = "bot_runtime"
+
+    agency_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agencies.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="stopped")
+    bot_username: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    last_heartbeat_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<BotRuntime agency_id={self.agency_id!s} status={self.status!r} "
+            f"username={self.bot_username!r}>"
+        )

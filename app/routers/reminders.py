@@ -3,11 +3,12 @@
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select, update as sa_update
 
 from app.core.config import get_internal_api_key
+from app.core.rate_limit import internal_limit
 from app.database import async_session_factory
 from app.models import CandidateReminder
 
@@ -46,7 +47,9 @@ class ReminderResponse(BaseModel):
     response_model=ReminderResponse,
     status_code=status.HTTP_201_CREATED,
 )
+@internal_limit()
 async def create_reminder(
+    request: Request,
     body: ReminderCreate,
     x_internal_key: str = Header(...),
 ) -> ReminderResponse:
@@ -83,7 +86,9 @@ async def create_reminder(
 
 
 @internal_router.post("/reminders/cancel", status_code=status.HTTP_200_OK)
+@internal_limit()
 async def cancel_reminders(
+    request: Request,
     body: ReminderCancel,
     x_internal_key: str = Header(...),
 ) -> dict:
