@@ -26,6 +26,8 @@ class CandidateResponse(CandidateBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
+    resume_file_path: str | None = None
+    avatar_file_path: str | None = None
     created_at: datetime
 
 
@@ -41,6 +43,17 @@ class ResumeUploadRequest(BaseModel):
 
 class ResumeUploadResponse(BaseModel):
     file_path: str
+
+
+class CandidateUploadAvatarRequest(BaseModel):
+    candidate_id: UUID
+    file_base64: str
+    filename: str = "avatar.jpg"
+
+
+class CandidateUploadAvatarResponse(BaseModel):
+    status: str = "ok"
+    avatar_file_path: str
 
 
 class ParseResumeHHResponse(BaseModel):

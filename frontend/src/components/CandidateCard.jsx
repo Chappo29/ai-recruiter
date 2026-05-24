@@ -336,7 +336,15 @@ export default function CandidateCard({
 
         <div style={{ display: 'flex', gap: 12, alignItems: 'flex-start' }}>
 
-          <Avatar name={screening.candidate_name || screening.candidate?.full_name} size={48} />
+          <Avatar
+            name={screening.candidate_name || screening.candidate?.full_name}
+            src={
+              (screening.candidate?.avatar_file_path || screening.avatar_file_path)
+                ? `${API_BASE_URL}${screening.candidate?.avatar_file_path || screening.avatar_file_path}`
+                : null
+            }
+            size={48}
+          />
 
           <div style={{ flex: 1, minWidth: 0 }}>
 

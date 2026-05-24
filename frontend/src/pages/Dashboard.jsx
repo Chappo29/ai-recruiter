@@ -4,7 +4,7 @@ import { useNavigate } from 'react-router-dom'
 
 import { AlertTriangle, Bot, Briefcase, Star, Users } from 'lucide-react'
 
-import client from '../api/client'
+import client, { API_BASE_URL } from '../api/client'
 
 import Avatar from '../components/Avatar'
 
@@ -460,7 +460,15 @@ export default function Dashboard() {
 
                 >
 
-                  <Avatar name={name} size={36} />
+                  <Avatar
+                    name={name}
+                    src={
+                      (s.candidate?.avatar_file_path || s.avatar_file_path)
+                        ? `${API_BASE_URL}${s.candidate?.avatar_file_path || s.avatar_file_path}`
+                        : null
+                    }
+                    size={36}
+                  />
 
                   <div style={{ flex: 1, minWidth: 0 }}>
 

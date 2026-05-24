@@ -102,6 +102,7 @@ class Candidate(Base):
     hh_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     resume_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     resume_file_path: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    avatar_file_path: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

@@ -182,7 +182,7 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
     async def _create_screening(
         vacancy_id: str, candidate_id: str, *, run_llm: bool = True
     ) -> str | None:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=120.0) as client:
             response = await _api_post(
                 client,
                 "/internal/screenings/",

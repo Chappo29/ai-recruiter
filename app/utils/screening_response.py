@@ -40,6 +40,7 @@ def to_screening_response(
             "candidate_telegram_id": cand.telegram_id if cand else None,
             "resume_text": cand.resume_text if cand else None,
             "resume_file_path": cand.resume_file_path if cand else None,
+            "avatar_file_path": cand.avatar_file_path if cand else None,
             "display_verdict": display_verdict,
             "verdict_label": verdict_label_for(screening),
             "screening_index": screening_index,

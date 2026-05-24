@@ -26,11 +26,15 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from slowapi.errors import RateLimitExceeded
-from slowapi.middleware import SlowAPIMiddleware
-
 from app.core.config import get_allowed_origins, validate_required_secrets
-from app.core.rate_limit import health_limit, limiter
+from app.core.rate_limit import SLOWAPI_AVAILABLE, health_limit, limiter
+
+if SLOWAPI_AVAILABLE:
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.middleware import SlowAPIMiddleware
+else:
+    RateLimitExceeded = Exception  # type: ignore[misc, assignment]
+    SlowAPIMiddleware = None  # type: ignore[misc, assignment]
 from app.database import engine
 from app.routers import auth, bots, candidates, questions, screenings, vacancies
 from app.routers.reminders import internal_router as reminders_internal_router
@@ -56,19 +60,25 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
-app.state.limiter = limiter
+if SLOWAPI_AVAILABLE and limiter is not None:
+    app.state.limiter = limiter
 
+    async def rate_limit_exceeded_handler(
+        request: Request, exc: RateLimitExceeded
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Слишком много запросов. Попробуйте позже."},
+            headers=exc.headers,
+        )
 
-async def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
-    return JSONResponse(
-        status_code=429,
-        content={"detail": "Слишком много запросов. Попробуйте позже."},
-        headers=exc.headers,
+    app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+    app.add_middleware(SlowAPIMiddleware)
+else:
+    logger.warning(
+        "slowapi is not installed — API starts without rate limits. "
+        "Prefer: .\\run-api.ps1 or .\\.venv\\Scripts\\python.exe -m uvicorn app.main:app --reload"
     )
-
-
-app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
-app.add_middleware(SlowAPIMiddleware)
 
 app.add_middleware(
     CORSMiddleware,
@@ -83,6 +93,7 @@ app.include_router(bots.router)
 app.include_router(vacancies.router)
 app.include_router(vacancies.internal_router)
 app.include_router(candidates.router)
+app.include_router(candidates.internal_router)
 app.include_router(screenings.router)
 app.include_router(screenings.internal_router)
 app.include_router(questions.router)
@@ -91,6 +102,7 @@ app.include_router(reminders_internal_router)
 
 MEDIA_DIR = Path(__file__).resolve().parent.parent / "media"
 (MEDIA_DIR / "resumes").mkdir(parents=True, exist_ok=True)
+(MEDIA_DIR / "avatars").mkdir(parents=True, exist_ok=True)
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
 

@@ -51,6 +51,7 @@ class ScreeningCandidateBrief(BaseModel):
     id: UUID
     full_name: str | None = None
     telegram_id: str | None = None
+    avatar_file_path: str | None = None
 
 
 class ScreeningResponse(BaseModel):
@@ -64,6 +65,7 @@ class ScreeningResponse(BaseModel):
     candidate_telegram_id: str | None = None
     resume_text: str | None = None
     resume_file_path: str | None = None
+    avatar_file_path: str | None = None
     verdict: str | None = None
     display_verdict: str | None = None
     verdict_label: str | None = None

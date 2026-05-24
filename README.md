@@ -67,14 +67,22 @@ alembic upgrade head
 
 ### 5. Run API (FastAPI)
 
-**Important:** use the project venv (folder `.venv`, not `venv`). If you run `uvicorn` from global Python, you will get `email-validator is not installed`.
+**Important:** use the project venv (folder `.venv`, not global `uvicorn`). Otherwise you may see `slowapi` / `email-validator is not installed`.
+
+**Recommended (Windows):**
+
+```powershell
+.\run-api.ps1
+```
+
+Or manually:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 $env:DATABASE_URL = "postgresql+asyncpg://postgres:postgres@localhost:5432/recruiter"
 $env:SECRET_KEY = "dev-secret-change-in-production"
-uvicorn app.main:app --reload
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload
 ```
 
 Open http://127.0.0.1:8000/docs for interactive API docs.
@@ -87,7 +95,8 @@ API and bot polling run in **separate processes**. FastAPI can use multiple work
 
 ```powershell
 # Terminal 2 — same .env / DATABASE_URL / SECRET_KEY / INTERNAL_API_KEY
-python -m bot
+.\run-bot.ps1
+# or: .\.venv\Scripts\python.exe -m bot
 ```
 
 Control API: http://127.0.0.1:8001/health  
@@ -117,7 +126,7 @@ docker exec -it recruiter-db psql -U postgres -d recruiter -c "SELECT tablename 
 |-------|-----|
 | `ConnectionRefusedError` / WinError 1225 on port 5432 | Run `docker compose up -d` or start local PostgreSQL |
 | `psql` not recognized | Use `docker exec` above or install PostgreSQL client tools |
-| `email-validator is not installed` | Activate `.venv` and `pip install -r requirements.txt` (do not use global Python) |
+| `email-validator is not installed` / `No module named 'slowapi'` | Use `.\run-api.ps1` or `.\.venv\Scripts\python.exe -m uvicorn ...` (not global `uvicorn`) |
 | `venv\Scripts\activate` not found | Folder is `.venv` — run `.\.venv\Scripts\Activate.ps1` |
 | `lxml` build failed on Python 3.13 | Use `lxml>=5.3` from requirements (prebuilt wheel); parser falls back to `html.parser` if lxml missing |
 | Auth / connection string errors with special password | URL-encode password with `urllib.parse.quote_plus` |

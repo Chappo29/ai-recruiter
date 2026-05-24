@@ -47,6 +47,42 @@ def extract_pdf_text(file_bytes: bytes) -> str:
     return "\n".join(page.extract_text() or "" for page in reader.pages)
 
 
+def extract_pdf_avatar(file_bytes: bytes) -> tuple[bytes, str] | None:
+    """
+    Возвращает (file_bytes, ext) первой найденной картинки на первой странице.
+    """
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+        if not reader.pages:
+            return None
+
+        first_page = reader.pages[0]
+        images = first_page.images
+        if not images:
+            return None
+
+        best: tuple[bytes, str] | None = None
+        best_size = 0
+        for img_obj in images.values():
+            data = img_obj.data
+            if not data:
+                continue
+            ext = (
+                img_obj.name.split(".")[-1].lower()
+                if "." in img_obj.name
+                else "jpg"
+            )
+            if ext not in ("jpg", "jpeg", "png", "webp"):
+                ext = "jpg"
+            if len(data) > best_size:
+                best_size = len(data)
+                best = (data, ext)
+        return best
+    except Exception as e:
+        logger.warning("Failed to extract avatar from PDF: %s", e)
+    return None
+
+
 async def run_resume_pipeline(
     *,
     bot: Bot,
@@ -137,12 +173,28 @@ async def run_resume_pipeline(
                         "filename": resume_input.filename or "resume.pdf",
                     },
                 )
-            if upload_resp.status_code not in (200, 201):
-                logger.warning(
-                    "Resume upload failed: %s %s",
-                    upload_resp.status_code,
-                    upload_resp.text,
-                )
+                if upload_resp.status_code not in (200, 201):
+                    logger.warning(
+                        "Resume upload failed: %s %s",
+                        upload_resp.status_code,
+                        upload_resp.text,
+                    )
+
+                avatar_data = extract_pdf_avatar(resume_input.file_bytes)
+                if avatar_data:
+                    img_bytes, ext = avatar_data
+                    img_b64 = base64.b64encode(img_bytes).decode()
+                    avatar_resp = await api_post(
+                        client,
+                        "/internal/candidates/upload-avatar",
+                        {
+                            "candidate_id": candidate_id,
+                            "file_base64": img_b64,
+                            "filename": f"avatar.{ext}",
+                        },
+                    )
+                    if avatar_resp.status_code not in (200, 201):
+                        logger.warning("Avatar upload failed: %s", avatar_resp.text)
 
         await cancel_reminder(telegram_id)
 
@@ -155,8 +207,10 @@ async def run_resume_pipeline(
             screening_id = await create_screening(
                 vacancy_id, candidate_id, run_llm=True
             )
-            if screening_id:
-                ud["screening_id"] = screening_id
+            if not screening_id:
+                await bot.send_message(chat_id, _MSG_PIPELINE_ERROR)
+                return
+            ud["screening_id"] = screening_id
             name = ud.get("first_name", "Кандидат")
             days = ud.get("feedback_days", 3)
             await bot.send_message(

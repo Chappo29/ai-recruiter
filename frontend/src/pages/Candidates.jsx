@@ -68,6 +68,13 @@ export default function Candidates() {
     loadScreenings()
   }, [loadScreenings])
 
+  useEffect(() => {
+    const hasPending = screenings.some((s) => s.status === 'pending')
+    if (!hasPending || !vacancyId) return undefined
+    const timer = setInterval(loadScreenings, 5000)
+    return () => clearInterval(timer)
+  }, [screenings, vacancyId, loadScreenings])
+
   const handleStatusChange = (id, status) => {
     setScreenings((prev) =>
       prev.map((s) =>
