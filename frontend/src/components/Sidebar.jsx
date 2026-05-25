@@ -1,10 +1,9 @@
-import { Bot, Briefcase, LayoutDashboard, MessageSquare, Users } from 'lucide-react'
+import { Bot, Briefcase, LayoutDashboard, Users } from 'lucide-react'
 import { useLocation, useNavigate } from 'react-router-dom'
 
 const MENU = [
   { path: '/dashboard', icon: LayoutDashboard, label: 'Дашборд' },
   { path: '/vacancies', icon: Briefcase, label: 'Вакансии' },
-  { path: '/questions', icon: MessageSquare, label: 'Вопросы' },
   { path: '/candidates', icon: Users, label: 'Кандидаты' },
   { path: '/bot', icon: Bot, label: 'Telegram-бот' },
 ]

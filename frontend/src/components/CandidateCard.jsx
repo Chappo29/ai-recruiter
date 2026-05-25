@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 
 import {
 
@@ -20,17 +20,24 @@ import {
 
   Mail,
 
-  MessageSquare,
-
   X,
 
 } from 'lucide-react'
 
 import client, { API_BASE_URL } from '../api/client'
 
-import { candidateFullName, nameTruncateStyle, screeningVerdict } from '../utils/candidate'
+import {
+  candidateFullName,
+  nameTruncateStyle,
+  screeningHrStatus,
+  screeningVerdict,
+} from '../utils/candidate'
 
 import { screeningExtras } from '../utils/parseJSON'
+import {
+  isAiAnalysisMissing,
+  isAiAnalysisPending,
+} from '../utils/screeningAnalysis'
 
 import { useToast } from './Toast'
 
@@ -38,6 +45,7 @@ import Avatar from './Avatar'
 
 import ScoreBar from './ScoreBar'
 
+import DialogLogView from './DialogLogView'
 import VerdictBadge from './VerdictBadge'
 
 
@@ -158,13 +166,9 @@ export default function CandidateCard({
 
   const [summaryExpanded, setSummaryExpanded] = useState(false)
 
-  const [questionsOpen, setQuestionsOpen] = useState(false)
-
   const [rejecting, setRejecting] = useState(false)
 
-  const [candidateAnswers, setCandidateAnswers] = useState([])
-
-  const [answersLoading, setAnswersLoading] = useState(true)
+  const [forwarding, setForwarding] = useState(false)
 
   const [historyOpen, setHistoryOpen] = useState(false)
 
@@ -178,17 +182,15 @@ export default function CandidateCard({
 
   const rejected = screening.status === 'rejected'
 
-  const isPending = screening.status === 'pending'
+  const aiAnalysisPending = isAiAnalysisPending(screening)
+  const aiAnalysisMissing = isAiAnalysisMissing(screening)
+  const [reanalyzing, setReanalyzing] = useState(false)
 
   const isRepeated = (screening.screening_index ?? 1) > 1
 
 
 
-  const { strengths, weaknesses, questions, redFlags, aiMarkers } =
-
-    screeningExtras(screening)
-
-  const interviewQuestions = questions
+  const { strengths, weaknesses, redFlags, aiMarkers } = screeningExtras(screening)
 
   const suspected = aiMarkers.suspected === true
 
@@ -206,45 +208,48 @@ export default function CandidateCard({
 
 
 
-  useEffect(() => {
-
-    if (!screening.id) return
-
-    setAnswersLoading(true)
-
-    client
-
-      .get(`/screenings/${screening.id}/answers`)
-
-      .then(({ data }) => setCandidateAnswers(data || []))
-
-      .catch(() => setCandidateAnswers([]))
-
-      .finally(() => setAnswersLoading(false))
-
-  }, [screening.id])
-
-
-
-  useEffect(() => {
-
-    if (!historyOpen || !screening.candidate_id) return
-
+  const toggleHistory = async () => {
+    const next = !historyOpen
+    setHistoryOpen(next)
+    if (!next || !screening.candidate_id) return
     setHistoryLoading(true)
+    try {
+      const { data } = await client.get(
+        `/screenings/candidate/${screening.candidate_id}/history`
+      )
+      setHistory(data || [])
+    } catch {
+      setHistory([])
+    } finally {
+      setHistoryLoading(false)
+    }
+  }
 
-    client
+  const handleReanalyze = async () => {
+    setReanalyzing(true)
+    try {
+      await client.post(`/screenings/${screening.id}/reanalyze`)
+      showToast('Анализ резюме запущен повторно')
+      onStatusChange?.(screening.id, screening.status)
+    } catch {
+      showToast('Не удалось запустить анализ', 'error')
+    } finally {
+      setReanalyzing(false)
+    }
+  }
 
-      .get(`/screenings/candidate/${screening.candidate_id}/history`)
-
-      .then(({ data }) => setHistory(data || []))
-
-      .catch(() => setHistory([]))
-
-      .finally(() => setHistoryLoading(false))
-
-  }, [historyOpen, screening.candidate_id])
-
-
+  const handleForward = async () => {
+    setForwarding(true)
+    try {
+      await client.patch(`/screenings/${screening.id}/status`, { status: 'forwarded' })
+      showToast('Кандидат передан дальше')
+      onStatusChange?.(screening.id, 'forwarded')
+    } catch {
+      showToast('Не удалось обновить статус', 'error')
+    } finally {
+      setForwarding(false)
+    }
+  }
 
   const handleReject = async () => {
 
@@ -438,7 +443,10 @@ export default function CandidateCard({
 
               <div style={{ textAlign: 'right', flexShrink: 0 }}>
 
-                <VerdictBadge verdict={screeningVerdict(screening)} />
+                <VerdictBadge
+                  verdict={screeningHrStatus(screening)}
+                  label={screening.verdict_label}
+                />
 
                 {screening.score != null && (
 
@@ -462,14 +470,43 @@ export default function CandidateCard({
 
 
 
-      {isPending && (
-
+      {aiAnalysisPending && (
         <div style={{ padding: '0 16px 12px', fontSize: 13, color: '#6B7280' }}>
-
           ИИ анализирует резюме…
-
         </div>
+      )}
 
+      {aiAnalysisMissing && (
+        <div
+          style={{
+            padding: '0 16px 12px',
+            fontSize: 13,
+            color: '#B45309',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: 8,
+            flexWrap: 'wrap',
+          }}
+        >
+          <span>Оценка ИИ не получена (анализ не завершился или ИИ недоступен)</span>
+          <button
+            type="button"
+            onClick={handleReanalyze}
+            disabled={reanalyzing}
+            style={{
+              padding: '4px 10px',
+              borderRadius: 6,
+              border: '1px solid #FDE68A',
+              background: '#FFFBEB',
+              color: '#B45309',
+              fontSize: 12,
+              cursor: reanalyzing ? 'wait' : 'pointer',
+            }}
+          >
+            {reanalyzing ? 'Запуск…' : 'Повторить анализ'}
+          </button>
+        </div>
       )}
 
 
@@ -526,7 +563,11 @@ export default function CandidateCard({
 
       <div style={{ padding: '0 16px 16px' }}>
 
-        <ScoreBar score={screening.score} pending={isPending} />
+        <ScoreBar
+          score={screening.score}
+          pending={aiAnalysisPending}
+          missing={aiAnalysisMissing}
+        />
 
       </div>
 
@@ -782,97 +823,7 @@ export default function CandidateCard({
 
 
 
-      {interviewQuestions.length > 0 && (
-
-        <div style={{ padding: '12px 16px', borderTop: '1px solid #F0F0F0' }}>
-
-          <button
-
-            type="button"
-
-            onClick={() => setQuestionsOpen(!questionsOpen)}
-
-            style={{
-
-              width: '100%',
-
-              display: 'flex',
-
-              alignItems: 'center',
-
-              justifyContent: 'space-between',
-
-              padding: 0,
-
-              border: 'none',
-
-              background: 'transparent',
-
-              fontSize: 13,
-
-              fontWeight: 600,
-
-              color: '#111827',
-
-              cursor: 'pointer',
-
-            }}
-
-          >
-
-            <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-
-              <MessageSquare size={16} />
-
-              Вопросы для интервью:
-
-            </span>
-
-            <span style={{ display: 'flex', alignItems: 'center', gap: 4, color: '#6B7280' }}>
-
-              {questionsOpen ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-
-            </span>
-
-          </button>
-
-          {questionsOpen && (
-
-            <ul
-
-              style={{
-
-                margin: '10px 0 0',
-
-                paddingLeft: 18,
-
-                fontSize: 13,
-
-                color: '#374151',
-
-                lineHeight: 1.5,
-
-              }}
-
-            >
-
-              {interviewQuestions.map((q, i) => (
-
-                <li key={i} style={{ marginBottom: 6 }}>
-
-                  {q}
-
-                </li>
-
-              ))}
-
-            </ul>
-
-          )}
-
-        </div>
-
-      )}
+      <DialogLogView dialogLog={screening.dialog_log} />
 
 
 
@@ -884,7 +835,7 @@ export default function CandidateCard({
 
             type="button"
 
-            onClick={() => setHistoryOpen(!historyOpen)}
+            onClick={toggleHistory}
 
             style={{
 
@@ -961,11 +912,10 @@ export default function CandidateCard({
                     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
 
                       <span>
-
+                        {item.vacancy_title || 'Вакансия'}
+                        {' · '}
                         {new Date(item.created_at).toLocaleDateString('ru-RU')}
-
                         {item.screening_index > 1 ? ` · Попытка ${item.screening_index}` : ''}
-
                       </span>
 
                       <VerdictBadge verdict={screeningVerdict(item)} />
@@ -985,80 +935,6 @@ export default function CandidateCard({
             </div>
 
           )}
-
-        </div>
-
-      )}
-
-
-
-      {!answersLoading && candidateAnswers.length > 0 && (
-
-        <div style={{ padding: '12px 16px', borderTop: '1px solid #F0F0F0' }}>
-
-          <div style={{ fontSize: 13, fontWeight: 600, color: '#111827', marginBottom: 10 }}>
-
-            Ответы кандидата:
-
-          </div>
-
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-
-            {candidateAnswers.map((item) => (
-
-              <div
-
-                key={item.id}
-
-                style={{
-
-                  padding: 12,
-
-                  borderRadius: 8,
-
-                  border: '1px solid #F0F0F0',
-
-                  background: '#F9FAFB',
-
-                }}
-
-              >
-
-                <div style={{ fontSize: 13, color: '#111827', marginBottom: 6 }}>
-
-                  {item.question_text || 'Вопрос'}
-
-                </div>
-
-                <div
-
-                  style={{
-
-                    fontSize: 13,
-
-                    color: '#374151',
-
-                    display: 'flex',
-
-                    alignItems: 'flex-start',
-
-                    gap: 6,
-
-                  }}
-
-                >
-
-                  <MessageSquare size={16} style={{ flexShrink: 0, marginTop: 2 }} />
-
-                  {item.answer_text || '—'}
-
-                </div>
-
-              </div>
-
-            ))}
-
-          </div>
 
         </div>
 
@@ -1128,6 +1004,30 @@ export default function CandidateCard({
 
           <Mail size={16} /> Открыть в Telegram
 
+        </button>
+
+        <button
+          type="button"
+          onClick={handleForward}
+          disabled={forwarding || rejected || screening.status === 'forwarded'}
+          style={{
+            flex: 1,
+            minWidth: 120,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 6,
+            padding: '10px 14px',
+            borderRadius: 8,
+            border: '1px solid #C7D2FE',
+            background: '#EEF2FF',
+            fontSize: 13,
+            fontWeight: 500,
+            color: '#4F46E5',
+            opacity: rejected || screening.status === 'forwarded' ? 0.5 : 1,
+          }}
+        >
+          Передан дальше
         </button>
 
         <button

@@ -4,14 +4,18 @@ import base64
 import io
 import logging
 from dataclasses import dataclass
-from typing import Any
 
 import httpx
 from pypdf import PdfReader
 from telegram import Bot
 from telegram.ext import ContextTypes
 
-from app.services.llm_service import extract_candidate_name_from_resume
+from app.services.llm_service import (
+    extract_candidate_name_from_resume,
+    fallback_interview_question,
+    run_bot_interview_turn,
+)
+from app.utils.name import parse_candidate_names
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,7 @@ _MSG_DOCX_STUB = (
     "Пожалуйста, отправьте резюме как PDF или текстом "
     "(можно вставить ссылку на hh.ru или кратко описать опыт)."
 )
+_MAX_INTERVIEW_TURNS = 5
 
 
 @dataclass
@@ -48,19 +53,13 @@ def extract_pdf_text(file_bytes: bytes) -> str:
 
 
 def extract_pdf_avatar(file_bytes: bytes) -> tuple[bytes, str] | None:
-    """
-    Возвращает (file_bytes, ext) первой найденной картинки на первой странице.
-    """
     try:
         reader = PdfReader(io.BytesIO(file_bytes))
         if not reader.pages:
             return None
-
-        first_page = reader.pages[0]
-        images = first_page.images
+        images = reader.pages[0].images
         if not images:
             return None
-
         best: tuple[bytes, str] | None = None
         best_size = 0
         for img_obj in images.values():
@@ -83,30 +82,35 @@ def extract_pdf_avatar(file_bytes: bytes) -> tuple[bytes, str] | None:
     return None
 
 
+async def _append_dialog(api_post, screening_id: str, messages: list[dict]) -> None:
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        await api_post(
+            client,
+            f"/internal/screenings/{screening_id}/dialog",
+            {"messages": messages},
+        )
+
+
 async def run_resume_pipeline(
     *,
     bot: Bot,
     chat_id: int,
     ctx: ContextTypes.DEFAULT_TYPE,
     agency_id: str,
-    backend: str,
-    headers: dict[str, str],
     resume_input: ResumeInput,
     api_post,
-    load_questions,
     create_screening,
-    complete_screening,
     cancel_reminder,
     create_reminder,
-    first_question_message,
-    next_question_message,
     final_message,
 ) -> None:
-    """Process resume off the hot path; update ctx.user_data and message user."""
     ud = ctx.user_data
     telegram_id = str(chat_id)
     vacancy_id = ud.get("vacancy_id")
     vacancy_title = ud.get("vacancy_title", "")
+    vacancy_company = ud.get("vacancy_company") or "Компания"
+    ai_prompt = ud.get("ai_screening_prompt")
+    vacancy_text = ud.get("vacancy_text") or vacancy_title
 
     try:
         if resume_input.kind == "pdf":
@@ -128,22 +132,25 @@ async def run_resume_pipeline(
             name_data = await extract_candidate_name_from_resume(resume_text)
         except Exception:
             logger.exception("LLM name extraction failed")
-            name_data = {
-                "first_name": "Кандидат",
-                "last_name": "",
-                "full_name": "Кандидат",
-            }
+            name_data = parse_candidate_names(resume_text)
 
-        ud["first_name"] = name_data["first_name"]
-        ud["full_name"] = name_data["full_name"]
+        names = parse_candidate_names(
+            resume_text,
+            llm_full_name=name_data.get("full_name"),
+            llm_first_name=name_data.get("first_name"),
+        )
+        ud["first_name"] = names["first_name"]
+        ud["full_name"] = names["full_name"]
         ud["resume_text"] = resume_text
+        first_name = names["first_name"]
 
         async with httpx.AsyncClient(timeout=120.0) as client:
             cand_response = await api_post(
                 client,
                 "/internal/candidates/",
                 {
-                    "full_name": name_data["full_name"],
+                    "full_name": ud["full_name"],
+                    "first_name": ud["first_name"],
                     "telegram_id": telegram_id,
                     "resume_text": resume_text,
                 },
@@ -174,11 +181,7 @@ async def run_resume_pipeline(
                     },
                 )
                 if upload_resp.status_code not in (200, 201):
-                    logger.warning(
-                        "Resume upload failed: %s %s",
-                        upload_resp.status_code,
-                        upload_resp.text,
-                    )
+                    logger.warning("Resume upload failed: %s", upload_resp.text)
 
                 avatar_data = extract_pdf_avatar(resume_input.file_bytes)
                 if avatar_data:
@@ -198,19 +201,65 @@ async def run_resume_pipeline(
 
         await cancel_reminder(telegram_id)
 
-        questions = await load_questions(vacancy_id)
-        ud["questions"] = questions
-        ud["answers"] = []
-        ud["question_index"] = 0
+        screening_id = await create_screening(vacancy_id, candidate_id, run_llm=True)
+        if not screening_id:
+            await bot.send_message(chat_id, _MSG_PIPELINE_ERROR)
+            return
 
-        if not questions:
-            screening_id = await create_screening(
-                vacancy_id, candidate_id, run_llm=True
+        ud["screening_id"] = screening_id
+        ud["dialog"] = []
+        ud["interview_turns"] = 0
+
+        use_ai_chat = bool((ai_prompt or "").strip()) or True
+
+        if use_ai_chat:
+            try:
+                turn = await run_bot_interview_turn(
+                    vacancy_title=vacancy_title,
+                    company=vacancy_company,
+                    vacancy_text=vacancy_text,
+                    ai_screening_prompt=ai_prompt,
+                    resume_text=resume_text,
+                    dialog=[],
+                    candidate_message=None,
+                    candidate_first_name=first_name,
+                )
+            except Exception:
+                logger.exception("Bot interview start failed")
+                turn = {
+                    "message": fallback_interview_question(
+                        ai_prompt, first_name=first_name
+                    ),
+                    "done": False,
+                }
+
+            bot_msg = turn.get("message", "")
+            await bot.send_message(chat_id, bot_msg)
+            await _append_dialog(
+                api_post,
+                screening_id,
+                [{"role": "assistant", "content": bot_msg}],
             )
-            if not screening_id:
-                await bot.send_message(chat_id, _MSG_PIPELINE_ERROR)
-                return
-            ud["screening_id"] = screening_id
+            ud["dialog"] = [{"role": "assistant", "content": bot_msg}]
+            ud["interview_turns"] = 1
+
+            if turn.get("done"):
+                days = ud.get("feedback_days", 3)
+                await bot.send_message(
+                    chat_id, final_message(first_name, days, had_questions=True)
+                )
+                ud["awaiting_questions"] = False
+                ud["conversation_finished"] = True
+            else:
+                await create_reminder(
+                    telegram_id=telegram_id,
+                    state="waiting_answers",
+                    vacancy_title=vacancy_title,
+                    screening_id=screening_id,
+                )
+                ud["awaiting_questions"] = True
+                ud["conversation_finished"] = False
+        else:
             name = ud.get("first_name", "Кандидат")
             days = ud.get("feedback_days", 3)
             await bot.send_message(
@@ -218,35 +267,78 @@ async def run_resume_pipeline(
             )
             ud["awaiting_questions"] = False
             ud["conversation_finished"] = True
-            return
-
-        screening_id = await create_screening(
-            vacancy_id, candidate_id, run_llm=False
-        )
-        if screening_id:
-            ud["screening_id"] = screening_id
-            await create_reminder(
-                telegram_id=telegram_id,
-                state="waiting_answers",
-                vacancy_title=vacancy_title,
-                screening_id=screening_id,
-            )
-        else:
-            logger.warning("Screening id missing after resume pipeline")
-
-        name = ud.get("first_name", "Кандидат")
-        total = len(questions)
-        text = first_question_message(name, total, questions[0]["text"])
-        await bot.send_message(chat_id, text)
-
-        ud["awaiting_questions"] = True
-        ud["conversation_finished"] = False
 
     except Exception:
         logger.exception("Resume pipeline failed for chat_id=%s", chat_id)
         await bot.send_message(chat_id, _MSG_PIPELINE_ERROR)
     finally:
         ud["processing_resume"] = False
+
+
+async def run_interview_reply(
+    *,
+    bot: Bot,
+    chat_id: int,
+    ctx: ContextTypes.DEFAULT_TYPE,
+    user_text: str,
+    api_post,
+    final_message,
+) -> bool:
+    """Handle one candidate reply in AI interview. Returns True if conversation ended."""
+    ud = ctx.user_data
+    screening_id = ud.get("screening_id")
+    if not screening_id:
+        return True
+
+    ud.setdefault("dialog", []).append({"role": "candidate", "content": user_text})
+    await _append_dialog(
+        api_post, screening_id, [{"role": "candidate", "content": user_text}]
+    )
+
+    turns = int(ud.get("interview_turns") or 0) + 1
+    ud["interview_turns"] = turns
+
+    try:
+        turn = await run_bot_interview_turn(
+            vacancy_title=ud.get("vacancy_title", ""),
+            company=ud.get("vacancy_company") or "Компания",
+            vacancy_text=ud.get("vacancy_text") or "",
+            ai_screening_prompt=ud.get("ai_screening_prompt"),
+            resume_text=ud.get("resume_text") or "",
+            dialog=ud.get("dialog", []),
+            candidate_message=user_text,
+            candidate_first_name=ud.get("first_name", "коллега"),
+        )
+    except Exception:
+        logger.exception("Bot interview turn failed")
+        turn = {"message": "Спасибо за ответ! Передаю информацию рекрутеру.", "done": True}
+
+    assistant_count = sum(
+        1 for e in ud.get("dialog", []) if (e.get("role") or "").lower() == "assistant"
+    )
+    min_q = 3 if (ud.get("ai_screening_prompt") or "").strip() else 2
+    llm_done = bool(turn.get("done"))
+    if llm_done and (assistant_count + 1) < min_q:
+        llm_done = False
+
+    done = llm_done or turns >= _MAX_INTERVIEW_TURNS
+    bot_msg = turn.get("message", "")
+    if bot_msg:
+        await bot.send_message(chat_id, bot_msg)
+        ud["dialog"].append({"role": "assistant", "content": bot_msg})
+        await _append_dialog(
+            api_post, screening_id, [{"role": "assistant", "content": bot_msg}]
+        )
+
+    if done:
+        name = ud.get("first_name", "Кандидат")
+        days = ud.get("feedback_days", 3)
+        await bot.send_message(chat_id, final_message(name, days, had_questions=True))
+        ud["awaiting_questions"] = False
+        ud["conversation_finished"] = True
+        return True
+
+    return False
 
 
 def schedule_resume_pipeline(
@@ -256,7 +348,6 @@ def schedule_resume_pipeline(
     ctx: ContextTypes.DEFAULT_TYPE,
     coro_factory,
 ) -> None:
-    """Fire-and-forget background task on the bot event loop."""
     import asyncio
 
     async def _wrapper() -> None:

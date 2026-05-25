@@ -36,7 +36,7 @@ else:
     RateLimitExceeded = Exception  # type: ignore[misc, assignment]
     SlowAPIMiddleware = None  # type: ignore[misc, assignment]
 from app.database import engine
-from app.routers import auth, bots, candidates, questions, screenings, vacancies
+from app.routers import auth, bots, candidates, screenings, vacancies
 from app.routers.reminders import internal_router as reminders_internal_router
 from app.scheduler import start_scheduler, stop_scheduler
 
@@ -96,8 +96,6 @@ app.include_router(candidates.router)
 app.include_router(candidates.internal_router)
 app.include_router(screenings.router)
 app.include_router(screenings.internal_router)
-app.include_router(questions.router)
-app.include_router(questions.internal_router)
 app.include_router(reminders_internal_router)
 
 MEDIA_DIR = Path(__file__).resolve().parent.parent / "media"

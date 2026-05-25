@@ -1,16 +1,19 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.utils.json_fields import parse_json_text
 
+ScreeningStatus = Literal["pending", "forwarded", "rejected"]
+SCREENING_STATUSES = frozenset({"pending", "forwarded", "rejected"})
+
 
 class ScreeningBase(BaseModel):
     vacancy_id: UUID
     candidate_id: UUID
-    status: str = Field(default="pending", max_length=32)
+    status: ScreeningStatus = "pending"
 
 
 class ScreeningCreate(BaseModel):
@@ -19,30 +22,29 @@ class ScreeningCreate(BaseModel):
 
 
 class ScreeningUpdate(BaseModel):
-    status: str | None = Field(default=None, max_length=32)
+    status: ScreeningStatus | None = None
     verdict: str | None = Field(default=None, max_length=32)
     score: int | None = None
     summary: str | None = None
 
 
 class ScreeningStatusUpdate(BaseModel):
-    status: str = Field(..., max_length=32)
+    status: ScreeningStatus
+
+    @field_validator("status")
+    @classmethod
+    def validate_status(cls, value: str) -> str:
+        if value not in SCREENING_STATUSES:
+            raise ValueError("status must be pending, forwarded, or rejected")
+        return value
 
 
 class ScreeningStats(BaseModel):
     vacancy_id: UUID
     total: int = 0
-    fit: int = 0
-    maybe: int = 0
-    reject: int = 0
     pending: int = 0
-
-
-class AnswersEvaluationResponse(BaseModel):
-    answers_summary: str | None = None
-    answers_score: int | None = None
-    strong_answers: list[str] = Field(default_factory=list)
-    weak_answers: list[str] = Field(default_factory=list)
+    forwarded: int = 0
+    rejected: int = 0
 
 
 class ScreeningCandidateBrief(BaseModel):
@@ -50,6 +52,7 @@ class ScreeningCandidateBrief(BaseModel):
 
     id: UUID
     full_name: str | None = None
+    first_name: str | None = None
     telegram_id: str | None = None
     avatar_file_path: str | None = None
 
@@ -59,6 +62,7 @@ class ScreeningResponse(BaseModel):
 
     id: UUID
     vacancy_id: UUID
+    vacancy_title: str | None = None
     candidate_id: UUID
     candidate: ScreeningCandidateBrief | None = None
     candidate_name: str | None = None

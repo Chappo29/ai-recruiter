@@ -5,8 +5,8 @@ import BotSettings from './pages/BotSettings'
 import Candidates from './pages/Candidates'
 import Dashboard from './pages/Dashboard'
 import Login from './pages/Login'
-import Questions from './pages/Questions'
 import Vacancies from './pages/Vacancies'
+import VacancyDetail from './pages/VacancyDetail'
 
 function Layout({ children }) {
   return (
@@ -46,10 +46,10 @@ export default function App() {
             }
           />
           <Route
-            path="/questions"
+            path="/vacancies/:id"
             element={
               <ProtectedRoute>
-                <Questions />
+                <VacancyDetail />
               </ProtectedRoute>
             }
           />

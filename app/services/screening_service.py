@@ -4,11 +4,10 @@ from uuid import UUID
 from fastapi import HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-
 from sqlalchemy.orm import joinedload
 
-from app.models import Candidate, CandidateAnswer, Screening, User, Vacancy
-from app.services.llm_service import evaluate_interview_answers, run_screening
+from app.models import Candidate, Screening, User, Vacancy
+from app.services.llm_service import run_screening
 from app.utils.json_fields import dump_json_text, parse_json_text
 
 logger = logging.getLogger(__name__)
@@ -26,33 +25,18 @@ def _build_dialog_log(llm_result: dict) -> dict | None:
     return payload or None
 
 
-def _merge_answers_evaluation_into_dialog_log(
-    existing: str | dict | list | None, evaluation: dict
-) -> dict:
+def merge_bot_dialog(existing: str | dict | list | None, messages: list[dict]) -> list[dict]:
     base = parse_json_text(existing)
     if base is None:
-        dialog: dict = {}
-    elif isinstance(base, dict):
-        dialog = dict(base)
+        dialog: list[dict] = []
+    elif isinstance(base, list):
+        dialog = list(base)
+    elif isinstance(base, dict) and "messages" in base:
+        dialog = list(base.get("messages") or [])
     else:
-        dialog = {"legacy": base}
-
-    dialog["answers_summary"] = evaluation.get("answers_summary")
-    dialog["answers_score"] = evaluation.get("answers_score")
-    dialog["strong_answers"] = evaluation.get("strong_answers") or []
-    dialog["weak_answers"] = evaluation.get("weak_answers") or []
+        dialog = [{"legacy": base}]
+    dialog.extend(messages)
     return dialog
-
-
-def _format_qa_pairs(answers: list[CandidateAnswer]) -> str:
-    lines: list[str] = []
-    for index, answer in enumerate(answers, start=1):
-        question_text = (
-            answer.question.text if answer.question else f"Вопрос {index}"
-        )
-        answer_text = answer.answer_text or "(нет ответа)"
-        lines.append(f"Вопрос: {question_text}\nОтвет: {answer_text}")
-    return "\n\n".join(lines)
 
 
 async def get_user_vacancy(
@@ -93,19 +77,17 @@ async def create_pending_screening(
 
 
 async def complete_screening(db: AsyncSession, screening_id: UUID) -> Screening:
-    result = await db.execute(select(Screening).where(Screening.id == screening_id))
+    result = await db.execute(
+        select(Screening)
+        .options(joinedload(Screening.candidate), joinedload(Screening.vacancy))
+        .where(Screening.id == screening_id)
+    )
     screening = result.scalar_one_or_none()
     if screening is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Screening not found")
 
-    vacancy_result = await db.execute(
-        select(Vacancy).where(Vacancy.id == screening.vacancy_id)
-    )
-    vacancy = vacancy_result.scalar_one_or_none()
-    candidate_result = await db.execute(
-        select(Candidate).where(Candidate.id == screening.candidate_id)
-    )
-    candidate = candidate_result.scalar_one_or_none()
+    vacancy = screening.vacancy
+    candidate = screening.candidate
 
     if vacancy is None or candidate is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Screening data not found")
@@ -115,9 +97,13 @@ async def complete_screening(db: AsyncSession, screening_id: UUID) -> Screening:
         for part in (vacancy.title, vacancy.requirements, vacancy.description)
         if part
     )
+    if vacancy.ai_screening_prompt:
+        vacancy_text = f"{vacancy_text}\n\nВводные рекрутера:\n{vacancy.ai_screening_prompt}"
+
     resume_text = candidate.resume_text
     if not resume_text or not resume_text.strip():
-        screening.status = "failed"
+        screening.summary = "Не удалось извлечь текст резюме для анализа."
+        screening.score = 0
         await db.commit()
         await db.refresh(screening)
         return screening
@@ -126,21 +112,42 @@ async def complete_screening(db: AsyncSession, screening_id: UUID) -> Screening:
         llm_result = await run_screening(vacancy_text, resume_text)
         score = llm_result.get("score")
         if score is not None:
-            score = int(score)
+            score = int(max(0, min(100, int(score))))
+        else:
+            score = 0
 
         screening.verdict = llm_result.get("verdict")
         screening.score = score
         screening.summary = llm_result.get("summary")
         screening.ai_markers = dump_json_text(llm_result.get("ai_markers"))
-        screening.dialog_log = dump_json_text(_build_dialog_log(llm_result))
-        screening.status = "completed"
+        ai_dialog = _build_dialog_log(llm_result)
+        if ai_dialog:
+            screening.dialog_log = dump_json_text(
+                merge_bot_dialog(screening.dialog_log, [{"role": "ai_analysis", "content": ai_dialog}])
+            )
     except Exception:
-        logger.exception("Screening %s failed", screening_id)
-        screening.status = "failed"
-        await db.commit()
-        await db.refresh(screening)
-        return screening
+        logger.exception("Screening LLM failed for %s", screening_id)
+        screening.summary = "Ошибка анализа резюме (ИИ недоступен или вернул неверный ответ)."
+        if screening.score is None:
+            screening.score = 0
 
+    await db.commit()
+    await db.refresh(screening)
+    return screening
+
+
+async def append_dialog_messages(
+    db: AsyncSession,
+    screening_id: UUID,
+    messages: list[dict],
+) -> Screening:
+    result = await db.execute(select(Screening).where(Screening.id == screening_id))
+    screening = result.scalar_one_or_none()
+    if screening is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Screening not found")
+
+    dialog = merge_bot_dialog(screening.dialog_log, messages)
+    screening.dialog_log = dump_json_text(dialog)
     await db.commit()
     await db.refresh(screening)
     return screening
@@ -154,98 +161,9 @@ async def run_and_save_screening(
     user: User | None = None,
 ) -> Screening:
     if user is not None:
-        vacancy = await get_user_vacancy(db, vacancy_id, user)
-    else:
-        result = await db.execute(select(Vacancy).where(Vacancy.id == vacancy_id))
-        vacancy = result.scalar_one_or_none()
-        if vacancy is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Vacancy not found",
-            )
+        await get_user_vacancy(db, vacancy_id, user)
 
-    result = await db.execute(select(Candidate).where(Candidate.id == candidate_id))
-    candidate = result.scalar_one_or_none()
-    if candidate is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Candidate not found")
-
-    vacancy_text = "\n\n".join(
-        part
-        for part in (
-            vacancy.title,
-            vacancy.requirements,
-            vacancy.description,
-        )
-        if part
+    screening = await create_pending_screening(
+        db, vacancy_id=vacancy_id, candidate_id=candidate_id
     )
-
-    resume_text = candidate.resume_text
-    if not resume_text or not resume_text.strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Candidate resume text is empty",
-        )
-
-    llm_result = await run_screening(vacancy_text, resume_text)
-
-    score = llm_result.get("score")
-    if score is not None:
-        score = int(score)
-
-    screening = Screening(
-        vacancy_id=vacancy.id,
-        candidate_id=candidate.id,
-        verdict=llm_result.get("verdict"),
-        score=score,
-        summary=llm_result.get("summary"),
-        ai_markers=dump_json_text(llm_result.get("ai_markers")),
-        dialog_log=dump_json_text(_build_dialog_log(llm_result)),
-        status="completed",
-    )
-    db.add(screening)
-    await db.commit()
-    await db.refresh(screening)
-    return screening
-
-
-async def evaluate_screening_answers(
-    db: AsyncSession,
-    screening_id: UUID,
-    user: User,
-) -> tuple[Screening, dict]:
-    result = await db.execute(
-        select(Screening)
-        .join(Vacancy, Screening.vacancy_id == Vacancy.id)
-        .options(joinedload(Screening.candidate))
-        .where(
-            Screening.id == screening_id,
-            Vacancy.user_id == user.id,
-        )
-    )
-    screening = result.scalar_one_or_none()
-    if screening is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Screening not found")
-
-    answers_result = await db.execute(
-        select(CandidateAnswer)
-        .where(CandidateAnswer.screening_id == screening_id)
-        .options(joinedload(CandidateAnswer.question))
-        .order_by(CandidateAnswer.created_at.asc())
-    )
-    answers = list(answers_result.scalars().unique().all())
-
-    if not answers:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No candidate answers to evaluate",
-        )
-
-    qa_pairs_text = _format_qa_pairs(answers)
-    evaluation = await evaluate_interview_answers(qa_pairs_text)
-
-    dialog = _merge_answers_evaluation_into_dialog_log(screening.dialog_log, evaluation)
-    screening.dialog_log = dump_json_text(dialog)
-
-    await db.commit()
-    await db.refresh(screening)
-    return screening, evaluation
+    return await complete_screening(db, screening.id)

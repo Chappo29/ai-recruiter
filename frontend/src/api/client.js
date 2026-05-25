@@ -1,9 +1,11 @@
 import axios from 'axios'
 
 // In dev, use Vite proxy (vite.config.js) with relative URLs to avoid CORS hangs.
+// In dev, /api is proxied to FastAPI (see vite.config.js) — avoids clashing with SPA routes
+// like /vacancies/:id and /candidates on refresh.
 export const API_BASE_URL =
   import.meta.env.VITE_API_URL ||
-  (import.meta.env.DEV ? '' : 'http://localhost:8000')
+  (import.meta.env.DEV ? '/api' : 'http://localhost:8000')
 
 const client = axios.create({
   baseURL: API_BASE_URL,

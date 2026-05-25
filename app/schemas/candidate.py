@@ -26,6 +26,7 @@ class CandidateResponse(CandidateBase):
     model_config = ConfigDict(from_attributes=True)
 
     id: UUID
+    first_name: str | None = None
     resume_file_path: str | None = None
     avatar_file_path: str | None = None
     created_at: datetime

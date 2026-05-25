@@ -1,25 +1,24 @@
 import { useCallback, useEffect, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Users } from 'lucide-react'
 import client from '../api/client'
 import CandidateCard from '../components/CandidateCard'
 import EmptyState from '../components/EmptyState'
 import { CandidateCardSkeleton } from '../components/Skeleton'
 import { PageTopbar } from '../components/Sidebar'
-import { screeningVerdict } from '../utils/candidate'
+import { screeningHrStatus, screeningVerdict } from '../utils/candidate'
+import { isAiAnalysisPending } from '../utils/screeningAnalysis'
 
 const FILTERS = [
   { key: 'all', label: 'Все' },
-  { key: 'fit', label: 'Подходит' },
-  { key: 'maybe', label: 'На рассмотрении' },
-  { key: 'reject', label: 'Не подходит' },
-  { key: 'pending', label: 'Обработка' },
-  { key: 'failed', label: 'Ошибка ИИ' },
-  { key: 'rejected', label: 'Отказ отправлен' },
+  { key: 'pending', label: 'На рассмотрении' },
+  { key: 'forwarded', label: 'Передан дальше' },
+  { key: 'rejected', label: 'Отказ' },
   { key: 'repeated', label: 'Повторные' },
 ]
 
 export default function Candidates() {
+  const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const urlVacancyId = searchParams.get('vacancy_id')
 
@@ -50,6 +49,17 @@ export default function Candidates() {
     if (urlVacancyId) setVacancyId(urlVacancyId)
   }, [urlVacancyId])
 
+  const refreshScreenings = useCallback(() => {
+    if (!vacancyId) {
+      setScreenings([])
+      return Promise.resolve()
+    }
+    return client
+      .get(`/screenings/vacancy/${vacancyId}`)
+      .then(({ data }) => setScreenings(data))
+      .catch(() => setScreenings([]))
+  }, [vacancyId])
+
   const loadScreenings = useCallback(() => {
     if (!vacancyId) {
       setScreenings([])
@@ -57,23 +67,19 @@ export default function Candidates() {
       return
     }
     setLoading(true)
-    client
-      .get(`/screenings/vacancy/${vacancyId}`)
-      .then(({ data }) => setScreenings(data))
-      .catch(() => setScreenings([]))
-      .finally(() => setLoading(false))
-  }, [vacancyId])
+    refreshScreenings().finally(() => setLoading(false))
+  }, [vacancyId, refreshScreenings])
 
   useEffect(() => {
     loadScreenings()
   }, [loadScreenings])
 
   useEffect(() => {
-    const hasPending = screenings.some((s) => s.status === 'pending')
+    const hasPending = screenings.some(isAiAnalysisPending)
     if (!hasPending || !vacancyId) return undefined
-    const timer = setInterval(loadScreenings, 5000)
+    const timer = setInterval(refreshScreenings, 5000)
     return () => clearInterval(timer)
-  }, [screenings, vacancyId, loadScreenings])
+  }, [screenings, vacancyId, refreshScreenings])
 
   const handleStatusChange = (id, status) => {
     setScreenings((prev) =>
@@ -82,8 +88,8 @@ export default function Candidates() {
           ? {
               ...s,
               status,
-              display_verdict:
-                status === 'rejected' ? 'rejected' : s.display_verdict,
+              display_verdict: status,
+              verdict_label: undefined,
             }
           : s
       )
@@ -95,8 +101,7 @@ export default function Candidates() {
   const filtered = screenings.filter((s) => {
     if (filter === 'all') return true
     if (filter === 'repeated') return (s.screening_index ?? 1) > 1
-    const dv = screeningVerdict(s)
-    return dv === filter
+    return screeningHrStatus(s) === filter
   })
 
   const showVacancySelect = !urlVacancyId
@@ -112,7 +117,11 @@ export default function Candidates() {
         {showVacancySelect && (
           <select
             value={vacancyId}
-            onChange={(e) => setVacancyId(e.target.value)}
+            onChange={(e) => {
+              const id = e.target.value
+              setVacancyId(id)
+              navigate(id ? `/candidates?vacancy_id=${id}` : '/candidates', { replace: true })
+            }}
             disabled={loadingVacancies || vacancies.length === 0}
             style={{
               width: '100%',

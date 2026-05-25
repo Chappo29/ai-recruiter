@@ -4,13 +4,13 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
-from sqlalchemy import select
+from fastapi import APIRouter, Header, HTTPException, Query, Request, status
+from sqlalchemy import delete, func, select
 
 from app.core.config import get_internal_api_key
 from app.core.rate_limit import internal_limit
 from app.deps import CurrentUser, DbSession
-from app.models import Agency, Candidate, User, Vacancy
+from app.models import Agency, Candidate, Screening, User, Vacancy
 from app.schemas.candidate import ResumeUploadRequest, ResumeUploadResponse
 from app.schemas.vacancy import (
     InternalVacancyItem,
@@ -19,8 +19,11 @@ from app.schemas.vacancy import (
     ParseVacancyHHResponse,
     VacancyCreate,
     VacancyResponse,
+    VacancyStatsResponse,
     VacancyStatusUpdate,
+    VacancyUpdate,
 )
+from app.utils.name import extract_first_name
 from app.services import hh_parser
 
 router = APIRouter(prefix="/vacancies", tags=["vacancies"])
@@ -43,10 +46,11 @@ async def create_vacancy(
     vacancy = Vacancy(
         user_id=current_user.id,
         title=body.title,
-        company=body.company,
+        company=body.company.strip(),
         hh_url=body.hh_url,
         requirements=body.requirements,
         description=body.description,
+        ai_screening_prompt=body.ai_screening_prompt,
     )
     db.add(vacancy)
     await db.commit()
@@ -84,6 +88,7 @@ async def list_agency_vacancies_internal(
         .where(
             Vacancy.user_id.in_(select(User.id).where(User.agency_id == agency_id)),
             Vacancy.status == "active",
+            Vacancy.archived_at.is_(None),
         )
         .order_by(Vacancy.created_at.desc())
     )
@@ -96,6 +101,9 @@ async def list_agency_vacancies_internal(
                 id=v.id,
                 title=v.title,
                 company=v.company,
+                requirements=v.requirements,
+                description=v.description,
+                ai_screening_prompt=v.ai_screening_prompt,
             )
             for v in vacancies
         ],
@@ -161,13 +169,15 @@ async def get_or_create_vacancy_internal(
             detail="Agency has no users",
         )
 
+    company = (body.get("company") or "").strip() or "Не указана"
     vacancy = Vacancy(
         user_id=user.id,
         title=body.get("title") or "Без названия",
-        company=body.get("company"),
+        company=company,
         hh_url=hh_url,
         requirements=body.get("requirements"),
         description=body.get("description"),
+        ai_screening_prompt=body.get("ai_screening_prompt"),
         status="active",
     )
     db.add(vacancy)
@@ -198,9 +208,21 @@ async def create_candidate_internal(
     )
     candidate = result.scalar_one_or_none()
 
+    full_name = body.get("full_name")
+    first_name = body.get("first_name")
+    if full_name and not first_name:
+        first_name = extract_first_name(full_name)
+    if full_name:
+        from app.utils.name import normalize_full_name
+
+        full_name = normalize_full_name(str(full_name))
+        if not first_name:
+            first_name = extract_first_name(full_name)
+
     if candidate:
-        if body.get("full_name"):
-            candidate.full_name = body.get("full_name")
+        if full_name:
+            candidate.full_name = full_name
+            candidate.first_name = first_name
         if body.get("resume_text"):
             candidate.resume_text = body.get("resume_text")
         if body.get("hh_url"):
@@ -210,7 +232,8 @@ async def create_candidate_internal(
         return {"id": str(candidate.id)}
 
     candidate = Candidate(
-        full_name=body.get("full_name"),
+        full_name=full_name,
+        first_name=first_name,
         telegram_id=str(telegram_id),
         hh_url=body.get("hh_url"),
         resume_text=body.get("resume_text"),
@@ -283,12 +306,14 @@ async def upload_candidate_resume(
 async def list_vacancies(
     db: DbSession,
     current_user: CurrentUser,
+    status: str | None = Query(default=None, description="Filter: active, archived, etc."),
 ) -> list[Vacancy]:
-    result = await db.execute(
-        select(Vacancy)
-        .where(Vacancy.user_id == current_user.id)
-        .order_by(Vacancy.created_at.desc())
-    )
+    query = select(Vacancy).where(Vacancy.user_id == current_user.id)
+    if status == "archived":
+        query = query.where(Vacancy.status == "archived")
+    else:
+        query = query.where(Vacancy.status != "archived")
+    result = await db.execute(query.order_by(Vacancy.created_at.desc()))
     return list(result.scalars().all())
 
 
@@ -330,4 +355,112 @@ async def update_vacancy_status(
     vacancy.status = body.status
     await db.commit()
     await db.refresh(vacancy)
+    return vacancy
+
+
+@router.patch("/{vacancy_id}", response_model=VacancyResponse)
+async def update_vacancy(
+    vacancy_id: UUID,
+    body: VacancyUpdate,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> Vacancy:
+    result = await db.execute(
+        select(Vacancy).where(
+            Vacancy.id == vacancy_id,
+            Vacancy.user_id == current_user.id,
+        )
+    )
+    vacancy = result.scalar_one_or_none()
+    if vacancy is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vacancy not found")
+
+    data = body.model_dump(exclude_unset=True)
+    for key, value in data.items():
+        if key == "company" and value is not None:
+            value = value.strip()
+        setattr(vacancy, key, value)
+    await db.commit()
+    await db.refresh(vacancy)
+    return vacancy
+
+
+@router.patch("/{vacancy_id}/archive", response_model=VacancyResponse)
+async def archive_vacancy(
+    vacancy_id: UUID,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> Vacancy:
+    result = await db.execute(
+        select(Vacancy).where(
+            Vacancy.id == vacancy_id,
+            Vacancy.user_id == current_user.id,
+        )
+    )
+    vacancy = result.scalar_one_or_none()
+    if vacancy is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vacancy not found")
+
+    vacancy.status = "archived"
+    vacancy.archived_at = func.now()
+    await db.commit()
+    await db.refresh(vacancy)
+    return vacancy
+
+
+@router.delete("/{vacancy_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_vacancy(
+    vacancy_id: UUID,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> None:
+    result = await db.execute(
+        select(Vacancy).where(
+            Vacancy.id == vacancy_id,
+            Vacancy.user_id == current_user.id,
+        )
+    )
+    vacancy = result.scalar_one_or_none()
+    if vacancy is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vacancy not found")
+
+    await db.execute(delete(Vacancy).where(Vacancy.id == vacancy_id))
+    await db.commit()
+
+
+@router.get("/{vacancy_id}/stats", response_model=VacancyStatsResponse)
+async def get_vacancy_stats(
+    vacancy_id: UUID,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> VacancyStatsResponse:
+    await _get_owned_vacancy(db, vacancy_id, current_user)
+
+    result = await db.execute(
+        select(Screening.status, func.count())
+        .where(Screening.vacancy_id == vacancy_id)
+        .group_by(Screening.status)
+    )
+    counts = {row[0]: row[1] for row in result.all()}
+    pending = counts.get("pending", 0)
+    forwarded = counts.get("forwarded", 0)
+    rejected = counts.get("rejected", 0)
+    return VacancyStatsResponse(
+        pending=pending,
+        forwarded=forwarded,
+        rejected=rejected,
+        total=pending + forwarded + rejected,
+    )
+
+
+async def _get_owned_vacancy(db: DbSession, vacancy_id: UUID, user: CurrentUser) -> Vacancy:
+    result = await db.execute(
+        select(Vacancy).where(
+            Vacancy.id == vacancy_id,
+            Vacancy.user_id == user.id,
+        )
+    )
+    vacancy = result.scalar_one_or_none()
+    if vacancy is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vacancy not found")
     return vacancy

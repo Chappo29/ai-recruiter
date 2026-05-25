@@ -1,26 +1,25 @@
-"""APScheduler-based reminder system for abandoned candidates."""
+"""APScheduler: candidate reminders and archived vacancy purge."""
 
 import logging
 from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sqlalchemy import select, update as sa_update
+from sqlalchemy import delete, select, update as sa_update
 
 from app.database import async_session_factory
-from app.models import CandidateReminder, Screening
+from app.models import CandidateReminder, Vacancy
 from bot.outbound import send_message
 
 logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler()
 
-# ── Timing constants ──────────────────────────────────────────────────────────
 _STATE_A_FIRST = timedelta(hours=4)
 _STATE_B_FIRST = timedelta(hours=2)
 _SECOND_REMINDER = timedelta(hours=24)
 _CLOSE_AT = timedelta(hours=72)
+_ARCHIVE_RETENTION = timedelta(days=30)
 
-# ── Message templates ─────────────────────────────────────────────────────────
 _MSG_A_4H = (
     "Привет! 👋 Вы начали отклик на вакансию {title}. "
     "Это займёт буквально пару минут — просто пришлите PDF резюме. "
@@ -42,7 +41,6 @@ _MSG_B_24H = (
 
 
 async def _send(agency_id: str, telegram_id: str, text: str) -> bool:
-    """Send a Telegram message; return True on success."""
     try:
         async with async_session_factory() as db:
             await send_message(db, agency_id, telegram_id, text)
@@ -65,8 +63,26 @@ async def _send(agency_id: str, telegram_id: str, text: str) -> bool:
         return False
 
 
+async def purge_old_archived_vacancies() -> None:
+    """Hard-delete vacancies archived more than 30 days ago (cascade screenings)."""
+    cutoff = datetime.now(tz=timezone.utc) - _ARCHIVE_RETENTION
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(Vacancy.id).where(
+                Vacancy.status == "archived",
+                Vacancy.archived_at.isnot(None),
+                Vacancy.archived_at < cutoff,
+            )
+        )
+        ids = [row[0] for row in result.all()]
+        if not ids:
+            return
+        await db.execute(delete(Vacancy).where(Vacancy.id.in_(ids)))
+        await db.commit()
+        logger.info("Purged %s archived vacancies older than 30 days", len(ids))
+
+
 async def check_reminders() -> None:
-    """Scheduled job: evaluate all active reminders and send messages / close sessions."""
     now = datetime.now(tz=timezone.utc)
 
     async with async_session_factory() as db:
@@ -94,7 +110,6 @@ async def _process_reminder(reminder: CandidateReminder, now: datetime) -> None:
     agency_id = reminder.agency_id
     telegram_id = reminder.telegram_id
 
-    # ── 72h: silent close ──────────────────────────────────────────────────
     if elapsed >= _CLOSE_AT:
         async with async_session_factory() as db:
             await db.execute(
@@ -102,12 +117,6 @@ async def _process_reminder(reminder: CandidateReminder, now: datetime) -> None:
                 .where(CandidateReminder.id == reminder.id)
                 .values(cancelled=True)
             )
-            if reminder.screening_id and reminder.state == "waiting_answers":
-                await db.execute(
-                    sa_update(Screening)
-                    .where(Screening.id == reminder.screening_id)
-                    .values(status="abandoned")
-                )
             await db.commit()
         logger.info(
             "Reminder id=%s closed at 72h (state=%s, telegram_id=%s)",
@@ -117,13 +126,12 @@ async def _process_reminder(reminder: CandidateReminder, now: datetime) -> None:
         )
         return
 
-    # ── 24h reminder ──────────────────────────────────────────────────────
     if not reminder.reminded_at_24h and elapsed >= _SECOND_REMINDER:
-        if reminder.state == "waiting_resume":
-            text = _MSG_A_24H.format(title=title)
-        else:
-            text = _MSG_B_24H.format(title=title)
-
+        text = (
+            _MSG_A_24H.format(title=title)
+            if reminder.state == "waiting_resume"
+            else _MSG_B_24H.format(title=title)
+        )
         sent = await _send(agency_id, telegram_id, text)
         if sent:
             async with async_session_factory() as db:
@@ -135,15 +143,14 @@ async def _process_reminder(reminder: CandidateReminder, now: datetime) -> None:
                 await db.commit()
         return
 
-    # ── First reminder (4h for State A, 2h for State B) ───────────────────
     if not reminder.reminded_at_first:
         threshold = _STATE_A_FIRST if reminder.state == "waiting_resume" else _STATE_B_FIRST
         if elapsed >= threshold:
-            if reminder.state == "waiting_resume":
-                text = _MSG_A_4H.format(title=title)
-            else:
-                text = _MSG_B_2H.format(title=title)
-
+            text = (
+                _MSG_A_4H.format(title=title)
+                if reminder.state == "waiting_resume"
+                else _MSG_B_2H.format(title=title)
+            )
             sent = await _send(agency_id, telegram_id, text)
             if sent:
                 async with async_session_factory() as db:
@@ -164,11 +171,19 @@ def start_scheduler() -> None:
         replace_existing=True,
         misfire_grace_time=120,
     )
+    scheduler.add_job(
+        purge_old_archived_vacancies,
+        trigger="interval",
+        hours=24,
+        id="purge_archived_vacancies",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
     scheduler.start()
-    logger.info("Reminder scheduler started (interval=15min)")
+    logger.info("Scheduler started (reminders=15min, archive purge=daily)")
 
 
 def stop_scheduler() -> None:
     if scheduler.running:
         scheduler.shutdown(wait=False)
-        logger.info("Reminder scheduler stopped")
+        logger.info("Scheduler stopped")

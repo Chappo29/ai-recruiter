@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Briefcase, Plus } from 'lucide-react'
 import client from '../api/client'
 import { useToast } from '../components/Toast'
@@ -21,6 +21,8 @@ function vacancyCompany(v) {
 
 export default function Vacancies() {
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const tab = searchParams.get('status') === 'archived' ? 'archived' : 'active'
   const { showToast } = useToast()
 
   const [vacancies, setVacancies] = useState([])
@@ -32,6 +34,7 @@ export default function Vacancies() {
   const [company, setCompany] = useState('')
   const [requirements, setRequirements] = useState('')
   const [description, setDescription] = useState('')
+  const [aiScreeningPrompt, setAiScreeningPrompt] = useState('')
   const [preview, setPreview] = useState(null)
   const [parsing, setParsing] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -40,7 +43,7 @@ export default function Vacancies() {
     setLoading(true)
     try {
       const [{ data: vacs }, { data: stats }] = await Promise.all([
-        client.get('/vacancies/'),
+        client.get('/vacancies/', { params: { status: tab === 'archived' ? 'archived' : undefined } }),
         client.get('/screenings/stats'),
       ])
       setVacancies(vacs)
@@ -58,7 +61,7 @@ export default function Vacancies() {
 
   useEffect(() => {
     load()
-  }, [])
+  }, [tab])
 
   const stats = useMemo(() => {
     const map = {}
@@ -66,7 +69,7 @@ export default function Vacancies() {
       const row = statsByVacancy[v.id]
       map[v.id] = {
         total: row?.total ?? 0,
-        fit: row?.fit ?? 0,
+        pending: row?.pending ?? 0,
       }
     })
     return map
@@ -99,6 +102,7 @@ export default function Vacancies() {
     setCompany('')
     setRequirements('')
     setDescription('')
+    setAiScreeningPrompt('')
     setPreview(null)
   }
 
@@ -107,14 +111,19 @@ export default function Vacancies() {
       showToast('Укажите название вакансии', 'error')
       return
     }
+    if (!company.trim()) {
+      showToast('Укажите компанию', 'error')
+      return
+    }
     setSaving(true)
     try {
       await client.post('/vacancies/', {
         title: title.trim(),
-        company: company.trim() || null,
+        company: company.trim(),
         hh_url: hhUrl || null,
         requirements: requirements || null,
         description: description || null,
+        ai_screening_prompt: aiScreeningPrompt.trim() || null,
       })
       showToast('Вакансия создана')
       setModalOpen(false)
@@ -137,7 +146,39 @@ export default function Vacancies() {
           marginBottom: 20,
         }}
       >
-        <h1 style={{ fontSize: 20, fontWeight: 600, color: '#111827' }}>Вакансии</h1>
+        <div>
+          <h1 style={{ fontSize: 20, fontWeight: 600, color: '#111827' }}>Вакансии</h1>
+          <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+            <button
+              type="button"
+              onClick={() => navigate('/vacancies')}
+              style={{
+                padding: '6px 12px',
+                borderRadius: 8,
+                border: 'none',
+                background: tab === 'active' ? '#EEF2FF' : 'transparent',
+                color: tab === 'active' ? '#4F46E5' : '#6B7280',
+                fontSize: 13,
+              }}
+            >
+              Активные
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate('/vacancies?status=archived')}
+              style={{
+                padding: '6px 12px',
+                borderRadius: 8,
+                border: 'none',
+                background: tab === 'archived' ? '#EEF2FF' : 'transparent',
+                color: tab === 'archived' ? '#4F46E5' : '#6B7280',
+                fontSize: 13,
+              }}
+            >
+              Архив
+            </button>
+          </div>
+        </div>
         <button
           type="button"
           onClick={() => {
@@ -176,7 +217,7 @@ export default function Vacancies() {
               <th style={{ padding: '12px 16px', fontWeight: 500, color: '#6B7280' }}>Вакансия</th>
               <th style={{ padding: '12px 16px', fontWeight: 500, color: '#6B7280' }}>Компания</th>
               <th style={{ padding: '12px 16px', fontWeight: 500, color: '#6B7280' }}>Кандидатов</th>
-              <th style={{ padding: '12px 16px', fontWeight: 500, color: '#6B7280' }}>Fit</th>
+              <th style={{ padding: '12px 16px', fontWeight: 500, color: '#6B7280' }}>На рассмотрении</th>
               <th style={{ padding: '12px 16px', fontWeight: 500, color: '#6B7280' }}>Статус</th>
               <th style={{ padding: '12px 16px', fontWeight: 500, color: '#6B7280' }}>Действия</th>
             </tr>
@@ -186,7 +227,7 @@ export default function Vacancies() {
               [1, 2, 3, 4].map((i) => <TableRowSkeleton key={i} />)}
             {!loading &&
               vacancies.map((v) => {
-                const st = stats[v.id] || { total: 0, fit: 0 }
+                const st = stats[v.id] || { total: 0, pending: 0 }
                 return (
                   <tr
                     key={v.id}
@@ -194,7 +235,7 @@ export default function Vacancies() {
                       borderTop: '1px solid #F0F0F0',
                       cursor: 'pointer',
                     }}
-                    onClick={() => navigate(`/candidates?vacancy_id=${v.id}`)}
+                    onClick={() => navigate(`/vacancies/${v.id}`)}
                     onMouseEnter={(e) => {
                       e.currentTarget.style.background = '#F9FAFB'
                     }}
@@ -226,7 +267,7 @@ export default function Vacancies() {
                     </td>
                     <td style={{ padding: '12px 16px' }}>{st.total}</td>
                     <td style={{ padding: '12px 16px', color: '#166534', fontWeight: 500 }}>
-                      {st.fit}
+                      {st.pending}
                     </td>
                     <td style={{ padding: '12px 16px' }}>
                       <span
@@ -238,7 +279,11 @@ export default function Vacancies() {
                           color: v.status === 'active' ? '#166534' : '#9CA3AF',
                         }}
                       >
-                        {v.status === 'active' ? 'Активна' : 'Закрыта'}
+                        {v.status === 'active'
+                          ? 'Активна'
+                          : v.status === 'archived'
+                            ? 'В архиве'
+                            : 'Закрыта'}
                       </span>
                     </td>
                     <td
@@ -253,9 +298,9 @@ export default function Vacancies() {
                           color: '#4F46E5',
                           fontSize: 13,
                         }}
-                        onClick={() => navigate(`/candidates?vacancy_id=${v.id}`)}
+                        onClick={() => navigate(`/vacancies/${v.id}`)}
                       >
-                        Кандидаты →
+                        Открыть →
                       </button>
                     </td>
                   </tr>
@@ -385,6 +430,13 @@ export default function Vacancies() {
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               rows={4}
+              style={{ ...inputStyle, resize: 'vertical' }}
+            />
+            <textarea
+              placeholder="Вводные для ИИ (опционально)"
+              value={aiScreeningPrompt}
+              onChange={(e) => setAiScreeningPrompt(e.target.value)}
+              rows={3}
               style={{ ...inputStyle, resize: 'vertical' }}
             />
 

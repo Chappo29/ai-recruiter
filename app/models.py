@@ -72,18 +72,21 @@ class Vacancy(Base):
         nullable=False,
     )
     title: Mapped[str] = mapped_column(String(255), nullable=False)
-    company: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    company: Mapped[str] = mapped_column(String(255), nullable=False)
     hh_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     requirements: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ai_screening_prompt: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    archived_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
     user: Mapped["User"] = relationship(back_populates="vacancies")
-    screenings: Mapped[list["Screening"]] = relationship(back_populates="vacancy")
-    questions: Mapped[list["Question"]] = relationship(
+    screenings: Mapped[list["Screening"]] = relationship(
         back_populates="vacancy", cascade="all, delete-orphan"
     )
 
@@ -98,6 +101,7 @@ class Candidate(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    first_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     telegram_id: Mapped[Optional[str]] = mapped_column(String(64), unique=True, nullable=True)
     hh_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     resume_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -144,72 +148,12 @@ class Screening(Base):
 
     vacancy: Mapped["Vacancy"] = relationship(back_populates="screenings")
     candidate: Mapped["Candidate"] = relationship(back_populates="screenings")
-    candidate_answers: Mapped[list["CandidateAnswer"]] = relationship(
-        back_populates="screening", cascade="all, delete-orphan"
-    )
 
     def __repr__(self) -> str:
         return (
             f"<Screening id={self.id!s} vacancy_id={self.vacancy_id!s} "
             f"candidate_id={self.candidate_id!s} status={self.status!r} "
             f"verdict={self.verdict!r}>"
-        )
-
-
-class Question(Base):
-    __tablename__ = "questions"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    vacancy_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("vacancies.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    text: Mapped[str] = mapped_column(Text, nullable=False)
-    order_index: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
-
-    vacancy: Mapped["Vacancy"] = relationship(back_populates="questions")
-    candidate_answers: Mapped[list["CandidateAnswer"]] = relationship(
-        back_populates="question", cascade="all, delete-orphan"
-    )
-
-    def __repr__(self) -> str:
-        return f"<Question id={self.id!s} vacancy_id={self.vacancy_id!s} order_index={self.order_index}>"
-
-
-class CandidateAnswer(Base):
-    __tablename__ = "candidate_answers"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    screening_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("screenings.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    question_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("questions.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    answer_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), nullable=False
-    )
-
-    screening: Mapped["Screening"] = relationship(back_populates="candidate_answers")
-    question: Mapped["Question"] = relationship(back_populates="candidate_answers")
-
-    def __repr__(self) -> str:
-        return (
-            f"<CandidateAnswer id={self.id!s} screening_id={self.screening_id!s} "
-            f"question_id={self.question_id!s}>"
         )
 
 
@@ -223,7 +167,6 @@ class CandidateReminder(Base):
     )
     telegram_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     agency_id: Mapped[str] = mapped_column(String(64), nullable=False)
-    # "waiting_resume" (State A) | "waiting_answers" (State B)
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     vacancy_title: Mapped[str] = mapped_column(String(255), nullable=False)
     screening_id: Mapped[Optional[uuid.UUID]] = mapped_column(
@@ -232,7 +175,6 @@ class CandidateReminder(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
-    # State A: first reminder at 4h; State B: first reminder at 2h
     reminded_at_first: Mapped[bool] = mapped_column(default=False, server_default="false")
     reminded_at_24h: Mapped[bool] = mapped_column(default=False, server_default="false")
     cancelled: Mapped[bool] = mapped_column(default=False, server_default="false", index=True)

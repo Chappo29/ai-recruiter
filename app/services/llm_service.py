@@ -123,21 +123,22 @@ def _compose_full_name(first_name: str, last_name: str) -> str:
 
 def _first_name_only(full_name: str, first_name: str) -> str:
     """Keep only the given name for bot greetings, not surname."""
-    full_name = full_name.strip()
-    first_name = first_name.strip()
-    if first_name and " " not in first_name:
-        return first_name
-    if full_name:
-        return full_name.split()[0]
-    return "Кандидат"
+    from app.utils.name import extract_first_name
+
+    fn = (first_name or "").strip()
+    if fn and " " not in fn:
+        return fn
+    return extract_first_name(full_name)
 
 
 async def extract_candidate_name_from_resume(resume_text: str) -> dict[str, str]:
     snippet = resume_text[:8000]
     prompt = (
-        "Извлеки из резюме полное имя кандидата (имя и фамилию).\n"
+        "Извлеки из резюме ФИО кандидата (обычно в первой строке, часто «Фамилия Имя»).\n"
+        "full_name — как в резюме (обе части). first_name — только имя для обращения.\n"
+        "Пример: «Биценко Владислав» → full_name «Биценко Владислав», first_name «Владислав».\n"
         "Верни ТОЛЬКО JSON:\n"
-        '{"full_name": "Имя Фамилия", "first_name": "Имя"}\n\n'
+        '{"full_name": "Фамилия Имя", "first_name": "Имя"}\n\n'
         f"Резюме: {snippet}"
     )
 
@@ -163,15 +164,17 @@ async def extract_candidate_name_from_resume(resume_text: str) -> dict[str, str]
         if legacy_first or last_name:
             full_name = _compose_full_name(legacy_first, last_name)
 
-    if not full_name:
-        full_name = "Кандидат"
+    from app.utils.name import parse_candidate_names
 
-    first_name = _first_name_only(full_name, first_name)
-
+    names = parse_candidate_names(
+        resume_text,
+        llm_full_name=full_name if full_name != "Кандидат" else None,
+        llm_first_name=first_name or None,
+    )
     return {
-        "first_name": first_name,
+        "first_name": names["first_name"],
         "last_name": "",
-        "full_name": full_name,
+        "full_name": names["full_name"],
     }
 
 
@@ -210,6 +213,123 @@ def _parse_llm_json(raw: str) -> dict:
     except json.JSONDecodeError:
         clean = raw.replace("```json", "").replace("```", "").strip()
         return json.loads(clean)
+
+
+BOT_INTERVIEW_SYSTEM = """
+Ты — дружелюбный HR-ассистент в Telegram. Веди короткий диалог с кандидатом после получения резюме.
+
+Правила:
+- Задавай ровно 1 вопрос за сообщение.
+- ОБЯЗАТЕЛЬНО опирайся на блок «Вводные рекрутера» — задай вопросы по каждому важному пункту оттуда.
+- Пока не задано достаточно вопросов (см. счётчики ниже), НЕ завершай диалог: "done" должно быть false.
+- На первом сообщении кандидату всегда "done": false и вопрос по вводным рекрутера / резюме.
+- Завершай ("done": true) только когда задано не меньше минимума вопросов и кандидат ответил на последний.
+
+Верни СТРОГО JSON:
+{
+  "message": "текст сообщения кандидату (с вопросом)",
+  "done": false
+}
+"""
+
+
+def _count_assistant_messages(dialog: list[dict]) -> int:
+    return sum(1 for e in dialog if (e.get("role") or "").lower() == "assistant")
+
+
+def _min_interview_questions(ai_screening_prompt: str | None) -> int:
+    if ai_screening_prompt and ai_screening_prompt.strip():
+        return 3
+    return 2
+
+
+def fallback_interview_question(
+    ai_screening_prompt: str | None, *, first_name: str = "коллега"
+) -> str:
+    focus = (ai_screening_prompt or "").strip()
+    if focus:
+        return (
+            f"Спасибо, {first_name}! 😊\n\n"
+            f"Чтобы лучше понять вашу кандидатуру, расскажите, пожалуйста: {focus}"
+        )
+    return (
+        f"Спасибо, {first_name}! 😊\n\n"
+        "Расскажите, пожалуйста, почему вас заинтересовала эта позиция "
+        "и какой релевантный опыт вы хотите применить?"
+    )
+
+
+async def run_bot_interview_turn(
+    *,
+    vacancy_title: str,
+    company: str,
+    vacancy_text: str,
+    ai_screening_prompt: str | None,
+    resume_text: str,
+    dialog: list[dict],
+    candidate_message: str | None = None,
+    candidate_first_name: str = "коллега",
+) -> dict:
+    focus = (ai_screening_prompt or "").strip() or (
+        "Уточни мотивацию, релевантный опыт и ожидания по зарплате."
+    )
+    min_questions = _min_interview_questions(ai_screening_prompt)
+    assistant_sent = _count_assistant_messages(dialog)
+    is_opening = candidate_message is None and assistant_sent == 0
+
+    history_lines = []
+    for entry in dialog[-12:]:
+        role = entry.get("role", "user")
+        text = entry.get("content") or entry.get("text") or ""
+        if isinstance(text, dict):
+            text = str(text)
+        history_lines.append(f"{role}: {text}")
+    if candidate_message:
+        history_lines.append(f"candidate: {candidate_message}")
+
+    user_block = (
+        f"Вакансия: {vacancy_title} ({company})\n"
+        f"Описание вакансии:\n{vacancy_text}\n\n"
+        f"Вводные рекрутера (приоритет для вопросов):\n{focus}\n\n"
+        f"Резюме кандидата:\n{resume_text[:6000]}\n\n"
+        f"Уже задано вопросов ботом: {assistant_sent}\n"
+        f"Минимум вопросов перед завершением: {min_questions}\n"
+        f"Это первое сообщение кандидату: {'да' if is_opening else 'нет'}\n\n"
+        f"История диалога:\n" + ("\n".join(history_lines) if history_lines else "(начало)")
+    )
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": BOT_INTERVIEW_SYSTEM + "\n\n" + user_block,
+        "stream": False,
+        "format": "json",
+    }
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        response = await client.post(OLLAMA_URL, json=payload)
+        response.raise_for_status()
+        raw = response.json()["response"].strip()
+
+    result = _parse_llm_json(raw)
+    message = str(result.get("message") or "").strip()
+    done = bool(result.get("done"))
+
+    if not message:
+        message = fallback_interview_question(ai_screening_prompt, first_name=candidate_first_name)
+        done = False
+
+    # Не завершать раньше минимума вопросов (считаем сообщение, которое сейчас отправим)
+    if done and (assistant_sent + 1) < min_questions:
+        done = False
+        if "?" not in message:
+            message = fallback_interview_question(
+                ai_screening_prompt, first_name=candidate_first_name
+            )
+
+    if is_opening:
+        done = False
+
+    return {"message": message, "done": done}
 
 
 async def evaluate_interview_answers(qa_pairs_text: str) -> dict:

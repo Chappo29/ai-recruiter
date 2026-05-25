@@ -5,7 +5,12 @@ export function scoreColor(score) {
   return '#F43F5E'
 }
 
-export default function ScoreBar({ score, showLabel = true, pending = false }) {
+export default function ScoreBar({
+  score,
+  showLabel = true,
+  pending = false,
+  missing = false,
+}) {
   if (pending && score == null) {
     return (
       <div>
@@ -38,6 +43,8 @@ export default function ScoreBar({ score, showLabel = true, pending = false }) {
 
   const value = score ?? 0
   const color = scoreColor(score)
+  const labelRight =
+    score != null ? `${score}/100` : missing ? 'Нет оценки' : '—'
 
   return (
     <div>
@@ -52,8 +59,13 @@ export default function ScoreBar({ score, showLabel = true, pending = false }) {
           }}
         >
           <span>Оценка</span>
-          <span style={{ fontWeight: 600, color: '#111827' }}>
-            {score != null ? `${score}/100` : '—'}
+          <span
+            style={{
+              fontWeight: 600,
+              color: missing ? '#B45309' : '#111827',
+            }}
+          >
+            {labelRight}
           </span>
         </div>
       )}

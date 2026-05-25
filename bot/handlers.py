@@ -14,11 +14,13 @@ from telegram.ext import (
 )
 
 from app.core.config import get_internal_api_key
+from bot.vacancy_context import build_vacancy_text
 from bot.resume_pipeline import (
     ResumeInput,
     _MSG_DOCX_STUB,
     _MSG_PROCESSING_ACK,
     _MSG_PROCESSING_BUSY,
+    run_interview_reply,
     run_resume_pipeline,
     schedule_resume_pipeline,
 )
@@ -69,19 +71,6 @@ def _vacancy_chosen_message(title: str, company: str | None) -> str:
         ]
     )
     return "\n".join(lines)
-
-
-def _first_question_message(name: str, total: int, question_text: str) -> str:
-    return (
-        f"Спасибо, {name}! 😊\n\n"
-        "Прежде чем передать вашу кандидатуру рекрутеру, "
-        "задам несколько коротких вопросов.\n\n"
-        f"Вопрос 1 из {total}:\n{question_text}"
-    )
-
-
-def _next_question_message(n: int, total: int, question_text: str) -> str:
-    return f"Вопрос {n} из {total}:\n{question_text}"
 
 
 def _final_message(name: str, days: int, *, had_questions: bool) -> str:
@@ -151,7 +140,10 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
 
         vacancy_id = query.data
         title = "Вакансия"
-        company = None
+        company = "Компания"
+        ai_prompt = None
+        requirements = None
+        description = None
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             vacancies_resp = await _api_get(
@@ -161,16 +153,25 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
                 for v in vacancies_resp.json().get("vacancies") or []:
                     if str(v["id"]) == vacancy_id:
                         title = v.get("title") or title
-                        company = v.get("company")
+                        company = v.get("company") or company
+                        requirements = v.get("requirements")
+                        description = v.get("description")
+                        ai_prompt = v.get("ai_screening_prompt")
                         break
 
         ctx.user_data["vacancy_id"] = vacancy_id
         ctx.user_data["vacancy_title"] = title
         ctx.user_data["vacancy_company"] = company
+        ctx.user_data["ai_screening_prompt"] = ai_prompt
+        ctx.user_data["vacancy_text"] = build_vacancy_text(
+            title=title,
+            company=company,
+            requirements=requirements,
+            description=description,
+        )
 
         await query.edit_message_text(_vacancy_chosen_message(title, company))
 
-        # State A: candidate chose vacancy but hasn't sent resume yet
         await _create_reminder(
             telegram_id=str(query.from_user.id),
             state="waiting_resume",
@@ -199,17 +200,6 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
         )
         return None
 
-    async def _complete_screening(screening_id: str) -> None:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{backend}/internal/screenings/{screening_id}/complete",
-                headers=_headers(),
-            )
-        if response.status_code not in (200, 201):
-            logger.error(
-                "Screening complete failed: %s %s", response.status_code, response.text
-            )
-
     async def _create_reminder(
         telegram_id: str,
         state: str,
@@ -228,7 +218,11 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
             async with httpx.AsyncClient(timeout=10.0) as client:
                 await _api_post(client, "/internal/reminders/", payload)
         except Exception:
-            logger.warning("Failed to create reminder for telegram_id=%s", telegram_id, exc_info=True)
+            logger.warning(
+                "Failed to create reminder for telegram_id=%s",
+                telegram_id,
+                exc_info=True,
+            )
 
     async def _cancel_reminder(telegram_id: str) -> None:
         try:
@@ -239,48 +233,11 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
                     {"telegram_id": telegram_id},
                 )
         except Exception:
-            logger.warning("Failed to cancel reminder for telegram_id=%s", telegram_id, exc_info=True)
-
-    async def _load_questions(vacancy_id: str) -> list[dict]:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                f"{backend}/internal/questions/vacancy/{vacancy_id}",
-                headers=_headers(),
+            logger.warning(
+                "Failed to cancel reminder for telegram_id=%s",
+                telegram_id,
+                exc_info=True,
             )
-        if response.status_code != 200:
-            return []
-        return response.json() or []
-
-    async def _send_final_message(
-        update: Update, ctx: ContextTypes.DEFAULT_TYPE, *, had_questions: bool
-    ) -> int:
-        name = ctx.user_data.get("first_name", "Кандидат")
-        days = ctx.user_data.get("feedback_days", 3)
-        await update.message.reply_text(
-            _final_message(name, days, had_questions=had_questions)
-        )
-        return ConversationHandler.END
-
-    async def _ask_current_question(
-        update: Update, ctx: ContextTypes.DEFAULT_TYPE
-    ) -> int:
-        questions = ctx.user_data.get("questions") or []
-        index = ctx.user_data.get("question_index", 0)
-        total = len(questions)
-
-        if index >= total:
-            return await _send_final_message(update, ctx, had_questions=total > 0)
-
-        question = questions[index]
-        name = ctx.user_data.get("first_name", "Кандидат")
-
-        if index == 0:
-            text = _first_question_message(name, total, question["text"])
-        else:
-            text = _next_question_message(index + 1, total, question["text"])
-
-        await update.message.reply_text(text)
-        return ASKING_QUESTIONS
 
     async def handle_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
         message = update.message
@@ -355,17 +312,11 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
                 chat_id=chat_id,
                 ctx=ctx,
                 agency_id=agency_id,
-                backend=backend,
-                headers=_headers(),
                 resume_input=resume_input,
                 api_post=_api_post,
-                load_questions=_load_questions,
                 create_screening=_create_screening,
-                complete_screening=_complete_screening,
                 cancel_reminder=_cancel_reminder,
                 create_reminder=_create_reminder,
-                first_question_message=_first_question_message,
-                next_question_message=_next_question_message,
                 final_message=_final_message,
             )
 
@@ -378,47 +329,23 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
             await update.message.reply_text("Пожалуйста, отправьте текстовый ответ.")
             return ASKING_QUESTIONS
 
-        questions = ctx.user_data.get("questions") or []
-        index = ctx.user_data.get("question_index", 0)
+        bot = ctx.application.bot
+        chat_id = update.effective_chat.id
 
-        if index >= len(questions):
-            return await _send_final_message(update, ctx, had_questions=True)
+        finished = await run_interview_reply(
+            bot=bot,
+            chat_id=chat_id,
+            ctx=ctx,
+            user_text=answer_text,
+            api_post=_api_post,
+            final_message=_final_message,
+        )
 
-        question = questions[index]
-        screening_id = ctx.user_data.get("screening_id")
+        if finished:
+            await _cancel_reminder(str(update.effective_user.id))
+            return ConversationHandler.END
 
-        if screening_id:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                await _api_post(
-                    client,
-                    "/internal/answers/",
-                    {
-                        "screening_id": screening_id,
-                        "question_id": question["id"],
-                        "answer_text": answer_text,
-                    },
-                )
-
-        ctx.user_data.setdefault("answers", []).append(answer_text)
-        ctx.user_data["question_index"] = index + 1
-
-        if ctx.user_data["question_index"] < len(questions):
-            next_index = ctx.user_data["question_index"]
-            total = len(questions)
-            next_q = questions[next_index]
-            await update.message.reply_text(
-                _next_question_message(next_index + 1, total, next_q["text"])
-            )
-            return ASKING_QUESTIONS
-
-        if screening_id:
-            await _complete_screening(screening_id)
-
-        await _cancel_reminder(str(update.effective_user.id))
-        ctx.user_data["awaiting_questions"] = False
-        ctx.user_data["conversation_finished"] = True
-
-        return await _send_final_message(update, ctx, had_questions=True)
+        return ASKING_QUESTIONS
 
     return ConversationHandler(
         entry_points=[CommandHandler("start", start)],

@@ -1,6 +1,6 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 
-import { useNavigate } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 
 import { AlertTriangle, Bot, Briefcase, Star, Users } from 'lucide-react'
 
@@ -16,9 +16,14 @@ import ScoreBar from '../components/ScoreBar'
 
 import VerdictBadge from '../components/VerdictBadge'
 
-import { candidateFullName, nameTruncateStyle, screeningVerdict } from '../utils/candidate'
+import {
+  candidateFullName,
+  nameTruncateStyle,
+  screeningHrStatus,
+} from '../utils/candidate'
 
 import { screeningExtras } from '../utils/parseJSON'
+import { isAiAnalysisMissing, isAiAnalysisPending } from '../utils/screeningAnalysis'
 
 import { MetricSkeleton } from '../components/Skeleton'
 
@@ -30,7 +35,7 @@ const EMPTY_METRICS = {
 
   totalCandidates: 0,
 
-  fitCount: 0,
+  pendingCount: 0,
 
   suspectedCount: 0,
 
@@ -57,6 +62,7 @@ function todayLabel() {
 export default function Dashboard() {
 
   const navigate = useNavigate()
+  const location = useLocation()
 
   const [vacancies, setVacancies] = useState([])
 
@@ -66,63 +72,61 @@ export default function Dashboard() {
 
   const [loading, setLoading] = useState(true)
 
+  const load = useCallback(async (opts = {}) => {
+    const silent = opts.silent === true
+    if (!silent) setLoading(true)
+    try {
+      const { data: vacs } = await client.get('/vacancies/')
+      setVacancies(vacs || [])
+      const active = (vacs || []).filter((v) => v.status === 'active').length
 
+      const [statsRes, recentRes] = await Promise.all([
+        client.get('/screenings/stats').catch(() => ({ data: [] })),
+        client.get('/screenings/recent', { params: { limit: 5 } }).catch(() => ({ data: [] })),
+      ])
+
+      const statsRows = statsRes.data || []
+      const recent = recentRes.data || []
+      setRecentScreenings(recent)
+
+      const totalFromStats = statsRows.reduce((sum, row) => sum + (row.total || 0), 0)
+      const pendingFromStats = statsRows.reduce((sum, row) => sum + (row.pending || 0), 0)
+
+      setMetrics({
+        activeVacancies: active,
+        totalCandidates: totalFromStats,
+        pendingCount: pendingFromStats,
+        suspectedCount: recent.filter((s) => {
+          const { aiMarkers: am } = screeningExtras(s)
+          return am.suspected === true
+        }).length,
+      })
+    } catch {
+      if (!silent) {
+        setVacancies([])
+        setRecentScreenings([])
+        setMetrics(EMPTY_METRICS)
+      }
+    } finally {
+      if (!silent) setLoading(false)
+    }
+  }, [])
 
   useEffect(() => {
-
-    const load = async () => {
-
-      try {
-
-        const { data: vacs } = await client.get('/vacancies/')
-
-        setVacancies(vacs || [])
-
-        const active = (vacs || []).filter((v) => v.status === 'active').length
-
-
-
-        const [statsRes, recentRes] = await Promise.all([
-          client.get('/screenings/stats').catch(() => ({ data: [] })),
-          client.get('/screenings/recent', { params: { limit: 5 } }).catch(() => ({ data: [] })),
-        ])
-
-        const statsRows = statsRes.data || []
-        const recent = recentRes.data || []
-        setRecentScreenings(recent)
-
-        const totalFromStats = statsRows.reduce((sum, row) => sum + (row.total || 0), 0)
-        const fitFromStats = statsRows.reduce((sum, row) => sum + (row.fit || 0), 0)
-
-        setMetrics({
-          activeVacancies: active,
-          totalCandidates: totalFromStats,
-          fitCount: fitFromStats,
-          suspectedCount: recent.filter((s) => {
-            const { aiMarkers: am } = screeningExtras(s)
-            return am.suspected === true
-          }).length,
-        })
-
-      } catch {
-
-        setVacancies([])
-
-        setRecentScreenings([])
-
-        setMetrics(EMPTY_METRICS)
-
-      } finally {
-
-        setLoading(false)
-
-      }
-
-    }
-
     load()
+  }, [load, location.pathname])
 
-  }, [])
+  useEffect(() => {
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') load({ silent: true })
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    const timer = setInterval(() => load({ silent: true }), 30000)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible)
+      clearInterval(timer)
+    }
+  }, [load])
 
 
 
@@ -242,9 +246,9 @@ export default function Dashboard() {
 
                 iconColor="#F59E0B"
 
-                value={metrics.fitCount}
+                value={metrics.pendingCount}
 
-                label="Подходящих"
+                label="На рассмотрении"
 
               />
 
@@ -518,11 +522,18 @@ export default function Dashboard() {
 
                     </div>
 
-                    <ScoreBar score={s.score} pending={s.status === 'pending'} />
+                    <ScoreBar
+                      score={s.score}
+                      pending={isAiAnalysisPending(s)}
+                      missing={isAiAnalysisMissing(s)}
+                    />
 
                   </div>
 
-                  <VerdictBadge verdict={screeningVerdict(s)} />
+                  <VerdictBadge
+                    verdict={screeningHrStatus(s)}
+                    label={s.verdict_label}
+                  />
 
                 </div>
 
