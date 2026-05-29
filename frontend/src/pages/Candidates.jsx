@@ -2,20 +2,10 @@ import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Users } from 'lucide-react'
 import client from '../api/client'
-import CandidateCard from '../components/CandidateCard'
+import KanbanBoard from '../components/KanbanBoard'
 import EmptyState from '../components/EmptyState'
-import { CandidateCardSkeleton } from '../components/Skeleton'
 import { PageTopbar } from '../components/Sidebar'
-import { screeningHrStatus, screeningVerdict } from '../utils/candidate'
 import { isAiAnalysisPending } from '../utils/screeningAnalysis'
-
-const FILTERS = [
-  { key: 'all', label: 'Все' },
-  { key: 'pending', label: 'На рассмотрении' },
-  { key: 'forwarded', label: 'Передан дальше' },
-  { key: 'rejected', label: 'Отказ' },
-  { key: 'repeated', label: 'Повторные' },
-]
 
 export default function Candidates() {
   const navigate = useNavigate()
@@ -25,7 +15,6 @@ export default function Candidates() {
   const [vacancies, setVacancies] = useState([])
   const [vacancyId, setVacancyId] = useState(urlVacancyId || '')
   const [screenings, setScreenings] = useState([])
-  const [filter, setFilter] = useState('all')
   const [loading, setLoading] = useState(true)
   const [loadingVacancies, setLoadingVacancies] = useState(true)
 
@@ -97,14 +86,9 @@ export default function Candidates() {
   }
 
   const selectedVacancy = vacancies.find((v) => String(v.id) === String(vacancyId))
-
-  const filtered = screenings.filter((s) => {
-    if (filter === 'all') return true
-    if (filter === 'repeated') return (s.screening_index ?? 1) > 1
-    return screeningHrStatus(s) === filter
-  })
-
-  const showVacancySelect = !urlVacancyId
+  
+  // Подсчет кандидатов в процессе AI анализа
+  const aiPendingCount = screenings.filter(isAiAnalysisPending).length
 
   return (
     <div>
@@ -114,74 +98,75 @@ export default function Candidates() {
       />
 
       <div style={{ padding: 24 }}>
-        {showVacancySelect && (
-          <select
-            value={vacancyId}
-            onChange={(e) => {
-              const id = e.target.value
-              setVacancyId(id)
-              navigate(id ? `/candidates?vacancy_id=${id}` : '/candidates', { replace: true })
-            }}
-            disabled={loadingVacancies || vacancies.length === 0}
+        <select
+          value={vacancyId}
+          onChange={(e) => {
+            const id = e.target.value
+            setVacancyId(id)
+            // Сохраняем выбранную вакансию в URL, чтобы после обновления страницы выбор не терялся
+            const next = new URLSearchParams(searchParams)
+            if (id) {
+              next.set('vacancy_id', id)
+            } else {
+              next.delete('vacancy_id')
+            }
+            navigate({ search: next.toString() }, { replace: true })
+          }}
+          disabled={loadingVacancies || vacancies.length === 0}
+          style={{
+            width: '100%',
+            maxWidth: 420,
+            marginBottom: 16,
+            padding: '10px 14px',
+            borderRadius: 8,
+            border: '1px solid #E5E7EB',
+            fontSize: 14,
+            background: '#FFFFFF',
+          }}
+        >
+          {vacancies.length === 0 ? (
+            <option value="">Нет вакансий</option>
+          ) : (
+            vacancies.map((v) => (
+              <option key={v.id} value={v.id}>
+                {v.title}
+              </option>
+            ))
+          )}
+        </select>
+
+        {/* Индикатор AI анализа */}
+        {aiPendingCount > 0 && (
+          <div
             style={{
-              width: '100%',
-              maxWidth: 420,
               marginBottom: 16,
-              padding: '10px 14px',
-              borderRadius: 8,
-              border: '1px solid #E5E7EB',
-              fontSize: 14,
-              background: '#FFFFFF',
+              fontSize: 13,
+              color: '#6B7280',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 6,
             }}
           >
-            {vacancies.length === 0 ? (
-              <option value="">Нет вакансий</option>
-            ) : (
-              vacancies.map((v) => (
-                <option key={v.id} value={v.id}>
-                  {v.title}
-                </option>
-              ))
-            )}
-          </select>
-        )}
-
-        {urlVacancyId && selectedVacancy && (
-          <p style={{ fontSize: 13, color: '#6B7280', marginBottom: 16 }}>
-            Вакансия: <strong style={{ color: '#111827' }}>{selectedVacancy.title}</strong>
-          </p>
-        )}
-
-        <div style={{ display: 'flex', gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
-          {FILTERS.map((f) => (
-            <button
-              key={f.key}
-              type="button"
-              onClick={() => setFilter(f.key)}
+            <div
               style={{
-                padding: '6px 14px',
-                borderRadius: 999,
-                border: filter === f.key ? 'none' : '1px solid #E5E7EB',
-                background: filter === f.key ? '#4F46E5' : '#FFFFFF',
-                color: filter === f.key ? '#FFFFFF' : '#374151',
-                fontSize: 13,
-                fontWeight: filter === f.key ? 500 : 400,
+                width: 8,
+                height: 8,
+                borderRadius: '50%',
+                background: '#4F46E5',
+                animation: 'pulse 2s infinite',
               }}
-            >
-              {f.label}
-            </button>
-          ))}
-        </div>
-
-        {loading && (
-          <div style={{ display: 'grid', gap: 16, maxWidth: 720 }}>
-            {[1, 2, 3].map((i) => (
-              <CandidateCardSkeleton key={i} />
-            ))}
+            />
+            ИИ анализирует {aiPendingCount} {aiPendingCount === 1 ? 'резюме' : 'резюме'}...
           </div>
         )}
 
-        {!loading && filtered.length === 0 && (
+        {loading && (
+          <div style={{ fontSize: 14, color: '#6B7280', padding: 40, textAlign: 'center' }}>
+            Загрузка кандидатов...
+          </div>
+        )}
+
+        {!loading && screenings.length === 0 && (
           <EmptyState
             icon={Users}
             title="Пока нет кандидатов"
@@ -189,23 +174,12 @@ export default function Candidates() {
           />
         )}
 
-        {!loading && filtered.length > 0 && (
-          <div
-            style={{
-              display: 'grid',
-              gap: 16,
-              maxWidth: 720,
-            }}
-          >
-            {filtered.map((s) => (
-              <CandidateCard
-                key={s.id}
-                screening={s}
-                vacancyTitle={selectedVacancy?.title}
-                onStatusChange={handleStatusChange}
-              />
-            ))}
-          </div>
+        {!loading && screenings.length > 0 && (
+          <KanbanBoard
+            screenings={screenings}
+            vacancyTitle={selectedVacancy?.title}
+            onStatusChange={handleStatusChange}
+          />
         )}
       </div>
     </div>

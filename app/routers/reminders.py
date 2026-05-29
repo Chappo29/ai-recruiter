@@ -7,17 +7,12 @@ from fastapi import APIRouter, Header, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select, update as sa_update
 
-from app.core.config import get_internal_api_key
+from app.core.internal_auth import verify_internal_key
 from app.core.rate_limit import internal_limit
 from app.database import async_session_factory
 from app.models import CandidateReminder
 
 internal_router = APIRouter(prefix="/internal", tags=["internal"])
-
-
-def _check_internal_key(x_internal_key: str) -> None:
-    if x_internal_key != get_internal_api_key():
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
 
 class ReminderCreate(BaseModel):
@@ -30,6 +25,7 @@ class ReminderCreate(BaseModel):
 
 class ReminderCancel(BaseModel):
     telegram_id: str
+    agency_id: str
 
 
 class ReminderResponse(BaseModel):
@@ -53,14 +49,7 @@ async def create_reminder(
     body: ReminderCreate,
     x_internal_key: str = Header(...),
 ) -> ReminderResponse:
-    _check_internal_key(x_internal_key)
-
-    screening_uuid: Optional[uuid.UUID] = None
-    if body.screening_id:
-        try:
-            screening_uuid = uuid.UUID(body.screening_id)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid screening_id")
+    verify_internal_key(x_internal_key)
 
     async with async_session_factory() as db:
         reminder = CandidateReminder(
@@ -68,7 +57,7 @@ async def create_reminder(
             agency_id=body.agency_id,
             state=body.state,
             vacancy_title=body.vacancy_title,
-            screening_id=screening_uuid,
+            screening_id=uuid.UUID(body.screening_id) if body.screening_id else None,
         )
         db.add(reminder)
         await db.commit()
@@ -92,12 +81,13 @@ async def cancel_reminders(
     body: ReminderCancel,
     x_internal_key: str = Header(...),
 ) -> dict:
-    _check_internal_key(x_internal_key)
+    verify_internal_key(x_internal_key)
 
     async with async_session_factory() as db:
         result = await db.execute(
             select(CandidateReminder).where(
                 CandidateReminder.telegram_id == body.telegram_id,
+                CandidateReminder.agency_id == body.agency_id,
                 CandidateReminder.cancelled == False,  # noqa: E712
             )
         )

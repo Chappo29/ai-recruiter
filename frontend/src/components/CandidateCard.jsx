@@ -24,7 +24,7 @@ import {
 
 } from 'lucide-react'
 
-import client, { API_BASE_URL } from '../api/client'
+import client, { mediaUrl } from '../api/client'
 
 import {
   candidateFullName,
@@ -343,11 +343,11 @@ export default function CandidateCard({
 
           <Avatar
             name={screening.candidate_name || screening.candidate?.full_name}
-            src={
-              (screening.candidate?.avatar_file_path || screening.avatar_file_path)
-                ? `${API_BASE_URL}${screening.candidate?.avatar_file_path || screening.avatar_file_path}`
-                : null
-            }
+            src={mediaUrl(
+              screening.avatar_url ||
+                screening.candidate?.avatar_file_path ||
+                screening.avatar_file_path
+            )}
             size={48}
           />
 
@@ -569,6 +569,26 @@ export default function CandidateCard({
           missing={aiAnalysisMissing}
         />
 
+        {screening.score_breakdown?.dimensions?.length > 0 && (
+          <details style={{ marginTop: 12, fontSize: 13, color: '#374151' }}>
+            <summary style={{ cursor: 'pointer', fontWeight: 600 }}>
+              Оценка по компетенциям
+              {screening.score_breakdown.bucket && (
+                <span style={{ marginLeft: 8, color: '#6B7280', fontWeight: 400 }}>
+                  ({screening.score_breakdown.bucket})
+                </span>
+              )}
+            </summary>
+            <ul style={{ margin: '8px 0 0', paddingLeft: 18, lineHeight: 1.5 }}>
+              {screening.score_breakdown.dimensions.map((d) => (
+                <li key={d.id}>
+                  {d.title || d.id}: {d.score_1_5}/5
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
+
       </div>
 
 
@@ -655,7 +675,7 @@ export default function CandidateCard({
 
               <a
 
-                href={`${API_BASE_URL}${screening.resume_file_path}`}
+                href={mediaUrl(screening.resume_url || screening.resume_file_path)}
 
                 target="_blank"
 
@@ -693,7 +713,7 @@ export default function CandidateCard({
 
               <a
 
-                href={`${API_BASE_URL}${screening.resume_file_path}`}
+                href={mediaUrl(screening.resume_url || screening.resume_file_path)}
 
                 download
 

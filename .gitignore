@@ -2,5 +2,19 @@
 .venv/
 __pycache__/
 *.pyc
-media/resumes/*.pdf
+
+# Logs (may contain bot tokens / PII)
+*.log
+bot.log
+bot_err.log
 uvicorn-test*.log
+
+# Uploaded media (candidate PII)
+media/resumes/*.pdf
+media/avatars/*
+media/user_avatars/*
+!media/**/.gitkeep
+
+# Local dev / tooling
+.claude/
+_diag.py

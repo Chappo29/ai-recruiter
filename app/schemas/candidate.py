@@ -38,6 +38,7 @@ class ParseHHRequest(BaseModel):
 
 class ResumeUploadRequest(BaseModel):
     candidate_id: UUID
+    agency_id: UUID
     file_base64: str
     filename: str = "resume.pdf"
 
@@ -48,6 +49,7 @@ class ResumeUploadResponse(BaseModel):
 
 class CandidateUploadAvatarRequest(BaseModel):
     candidate_id: UUID
+    agency_id: UUID
     file_base64: str
     filename: str = "avatar.jpg"
 

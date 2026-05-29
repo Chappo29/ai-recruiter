@@ -15,11 +15,26 @@ async def start_polling(agency_id: str, token: str, backend_url: str) -> None:
         logger.info("Bot polling already active for agency %s", agency_id)
         return
 
+    from app.core.config import BOT_RATE_LIMIT_SEC
+
     app = Application.builder().token(token).build()
 
-    from bot.handlers import build_conversation_handler
+    from telegram import Update
+    from telegram.ext import TypeHandler
 
-    app.add_handler(build_conversation_handler(agency_id, backend_url))
+    from bot.handlers import build_conversation_handler
+    from bot.middleware import ThrottleHandler
+
+    # Group -2: rate limit runs first (can block update entirely).
+    # Group -1: session restore — must be in its own group, otherwise (as a
+    # TypeHandler matching every Update) it consumes the update inside the
+    # group and the conv_handler never sees /start or any other message.
+    # Group  0: actual conversation handler.
+    app.add_handler(ThrottleHandler(rate_limit=BOT_RATE_LIMIT_SEC), group=-2)
+
+    conv_handler, restore_handler = build_conversation_handler(agency_id, backend_url)
+    app.add_handler(TypeHandler(Update, restore_handler), group=-1)
+    app.add_handler(conv_handler, group=0)
 
     await app.initialize()
     await app.start()

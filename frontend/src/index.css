@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
 
 * {
   box-sizing: border-box;
@@ -6,10 +6,25 @@
   padding: 0;
 }
 
+html {
+  /* Масштабирует всё пропорционально: шрифты, отступы, иконки */
+  zoom: 1.12;
+  height: 100%;
+}
+
+body, #root {
+  height: 100%;
+  overflow: hidden;
+}
+
 body {
-  font-family: 'Inter', sans-serif;
+  font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
   background: #f8f9fb;
   color: #111827;
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 button {
@@ -48,5 +63,35 @@ textarea {
   }
   to {
     transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* Скроллбар для колонок Kanban */
+@media (min-width: 768px) {
+  div::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  
+  div::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  
+  div::-webkit-scrollbar-thumb {
+    background: #D1D5DB;
+    border-radius: 4px;
+  }
+  
+  div::-webkit-scrollbar-thumb:hover {
+    background: #9CA3AF;
   }
 }

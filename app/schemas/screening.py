@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.schemas.llm import ScoreBreakdown
+
 from app.utils.json_fields import parse_json_text
 
 ScreeningStatus = Literal["pending", "forwarded", "rejected"]
@@ -70,6 +72,8 @@ class ScreeningResponse(BaseModel):
     resume_text: str | None = None
     resume_file_path: str | None = None
     avatar_file_path: str | None = None
+    avatar_url: str | None = None
+    resume_url: str | None = None
     verdict: str | None = None
     display_verdict: str | None = None
     verdict_label: str | None = None
@@ -79,6 +83,7 @@ class ScreeningResponse(BaseModel):
     dialog_log: list[Any] | dict[str, Any] | None = None
     status: str
     screening_index: int | None = None
+    score_breakdown: ScoreBreakdown | None = None
     created_at: datetime
 
     @field_validator("ai_markers", "dialog_log", mode="before")

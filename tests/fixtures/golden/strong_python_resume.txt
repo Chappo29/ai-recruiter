@@ -1,0 +1,12 @@
+Иван Петров
+Python Developer
+
+Опыт: 4 года
+
+Навыки: Python, FastAPI, PostgreSQL, Docker, Redis
+
+Достижения:
+- Разработал REST API для 50k пользователей, снизил latency на 35%
+- Внедрил CI/CD pipeline в команде из 5 человек
+
+Образование: МГУ, прикладная математика

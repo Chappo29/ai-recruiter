@@ -1,0 +1,6 @@
+{
+  "title": "Python Developer",
+  "requirements": "Python 3+, FastAPI, PostgreSQL, 3+ years experience",
+  "description": "Backend developer for HR tech product",
+  "ai_screening_prompt": "Must have production Python experience"
+}

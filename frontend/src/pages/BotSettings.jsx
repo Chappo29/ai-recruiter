@@ -37,10 +37,7 @@ export default function BotSettings() {
   const busy = action !== null
   const hasToken = Boolean(tokenInfo?.has_token)
   const showTokenInput = !hasToken || editingToken
-  const botLink =
-    isRunning && status?.bot_username
-      ? `t.me/${status.bot_username}`
-      : null
+  const botLink = status?.bot_username ? `t.me/${status.bot_username}` : null
 
   const startBot = async () => {
     if (!token.trim() && !hasToken) {
@@ -423,10 +420,13 @@ export default function BotSettings() {
                   background: '#F9FAFB',
                 }}
               >
-                <span style={{ flex: 1, fontSize: 14, color: '#4F46E5' }}>{botLink}</span>
+                <span style={{ flex: 1, fontSize: 14, color: isRunning ? '#4F46E5' : '#9CA3AF' }}>
+                  {botLink}
+                </span>
                 <button
                   type="button"
                   onClick={copyLink}
+                  disabled={!isRunning}
                   style={{
                     display: 'flex',
                     alignItems: 'center',
@@ -436,12 +436,18 @@ export default function BotSettings() {
                     border: '1px solid #E5E7EB',
                     background: '#FFFFFF',
                     fontSize: 12,
-                    color: '#374151',
+                    color: isRunning ? '#374151' : '#9CA3AF',
+                    cursor: isRunning ? 'pointer' : 'not-allowed',
                   }}
                 >
                   <Copy size={14} /> Скопировать
                 </button>
               </div>
+              {!isRunning && (
+                <p style={{ fontSize: 12, color: '#9CA3AF', marginTop: 6 }}>
+                  Бот остановлен — запустите, чтобы ссылка заработала для кандидатов.
+                </p>
+              )}
             </>
           )}
         </div>

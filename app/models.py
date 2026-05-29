@@ -49,6 +49,9 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(String(32), nullable=False, default="recruiter")
+    first_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    last_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    avatar_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -89,9 +92,128 @@ class Vacancy(Base):
     screenings: Mapped[list["Screening"]] = relationship(
         back_populates="vacancy", cascade="all, delete-orphan"
     )
+    rubrics: Mapped[list["VacancyRubric"]] = relationship(
+        back_populates="vacancy", cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
-        return f"<Vacancy id={self.id!s} title={self.title!r} status={self.status!r}>"
+        return (
+            f"<Vacancy id={self.id!s} title={self.title!r} status={self.status!r}>"
+        )
+
+
+class VacancyRubric(Base):
+    __tablename__ = "vacancy_rubrics"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    vacancy_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("vacancies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    rubric_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    approved_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    approved_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    vacancy: Mapped["Vacancy"] = relationship(back_populates="rubrics")
+
+
+class VacancyInterviewQuestion(Base):
+    __tablename__ = "vacancy_interview_questions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    vacancy_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("vacancies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    rubric_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("vacancy_rubrics.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    competency_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    question_text: Mapped[str] = mapped_column(Text, nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    required: Mapped[bool] = mapped_column(default=True, server_default="true")
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="rubric")
+
+
+class InterviewAnswer(Base):
+    __tablename__ = "interview_answers"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    screening_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("screenings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    question_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("vacancy_interview_questions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    answer_text: Mapped[str] = mapped_column(Text, nullable=False)
+    score_1_5: Mapped[Optional[int]] = mapped_column(nullable=True)
+    evidence_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class ScreeningScore(Base):
+    __tablename__ = "screening_scores"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    screening_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("screenings.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    rubric_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("vacancy_rubrics.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    rubric_version: Mapped[Optional[int]] = mapped_column(nullable=True)
+    extracted_profile_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    dimension_scores_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    overall_score: Mapped[Optional[int]] = mapped_column(nullable=True)
+    bucket: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    prompt_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    screening: Mapped["Screening"] = relationship(back_populates="score_detail")
 
 
 class Candidate(Base):
@@ -100,9 +222,15 @@ class Candidate(Base):
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
+    agency_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agencies.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     full_name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     first_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
-    telegram_id: Mapped[Optional[str]] = mapped_column(String(64), unique=True, nullable=True)
+    telegram_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     hh_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     resume_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     resume_file_path: Mapped[Optional[str]] = mapped_column(String, nullable=True)
@@ -118,6 +246,39 @@ class Candidate(Base):
             f"<Candidate id={self.id!s} full_name={self.full_name!r} "
             f"telegram_id={self.telegram_id!r}>"
         )
+
+
+class TeamInvitation(Base):
+    """Pending team member invitations (persisted, survives restarts)."""
+
+    __tablename__ = "team_invitations"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    agency_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agencies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    email: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    invited_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
 
 
 class Screening(Base):
@@ -148,6 +309,9 @@ class Screening(Base):
 
     vacancy: Mapped["Vacancy"] = relationship(back_populates="screenings")
     candidate: Mapped["Candidate"] = relationship(back_populates="screenings")
+    score_detail: Mapped[Optional["ScreeningScore"]] = relationship(
+        back_populates="screening", uselist=False, cascade="all, delete-orphan"
+    )
 
     def __repr__(self) -> str:
         return (
@@ -186,6 +350,79 @@ class CandidateReminder(Base):
         )
 
 
+class AIDecisionLog(Base):
+    """Audit trail for AI-assisted hiring decisions (compliance)."""
+
+    __tablename__ = "ai_decision_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    screening_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("screenings.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    agency_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agencies.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    decision_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    actor_type: Mapped[str] = mapped_column(String(16), nullable=False, default="ai")
+    actor_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    ai_score: Mapped[Optional[int]] = mapped_column(nullable=True)
+    ai_verdict: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    reasoning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    human_override: Mapped[bool] = mapped_column(default=False, server_default="false")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<AIDecisionLog id={self.id!s} screening_id={self.screening_id!s} "
+            f"type={self.decision_type!r} actor={self.actor_type!r}>"
+        )
+
+
+class BotConversationState(Base):
+    """Persistent Telegram bot dialog state (survives bot-worker restarts)."""
+
+    __tablename__ = "bot_conversation_states"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    telegram_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    agency_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agencies.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    step: Mapped[str] = mapped_column(String(32), nullable=False)
+    state_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<BotConversationState telegram_id={self.telegram_id!r} "
+            f"agency_id={self.agency_id!s} step={self.step!r}>"
+        )
+
+
 class BotRuntime(Base):
     """Bot-worker heartbeat and status (one row per agency)."""
 
@@ -206,4 +443,37 @@ class BotRuntime(Base):
         return (
             f"<BotRuntime agency_id={self.agency_id!s} status={self.status!r} "
             f"username={self.bot_username!r}>"
+        )
+
+
+class Notification(Base):
+    """In-app recruiter notifications."""
+
+    __tablename__ = "notifications"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    type: Mapped[str] = mapped_column(String(32), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    action_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    meta: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    read_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<Notification id={self.id!s} user_id={self.user_id!s} "
+            f"type={self.type!r} read_at={self.read_at!r}>"
         )

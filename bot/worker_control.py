@@ -8,15 +8,14 @@ from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from app.core.config import get_internal_api_key
+from app.core.config import BACKEND_URL
+from app.core.internal_auth import verify_internal_key
 from app.database import async_session_factory
 from app.models import Agency
 from app.services import bot_runtime_service
 from bot import polling
 
 logger = logging.getLogger(__name__)
-
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
 control_app = FastAPI(title="RecruitAI Bot Worker", version="0.1.0")
 
@@ -32,8 +31,7 @@ class StopBody(BaseModel):
 
 
 def _check_key(x_internal_key: str) -> None:
-    if x_internal_key != get_internal_api_key():
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+    verify_internal_key(x_internal_key)
 
 
 @control_app.post("/control/start")

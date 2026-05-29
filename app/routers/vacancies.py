@@ -7,10 +7,11 @@ from uuid import UUID
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from sqlalchemy import delete, func, select
 
-from app.core.config import get_internal_api_key
-from app.core.rate_limit import internal_limit
+from app.core.internal_auth import verify_internal_key
+from app.core.rate_limit import internal_limit, parse_hh_limit
+from app.core.rbac import UserRole, require_role
 from app.deps import CurrentUser, DbSession
-from app.models import Agency, Candidate, Screening, User, Vacancy
+from app.models import Agency, Candidate, Screening, User, Vacancy, VacancyRubric
 from app.schemas.candidate import ResumeUploadRequest, ResumeUploadResponse
 from app.schemas.vacancy import (
     InternalVacancyItem,
@@ -23,18 +24,16 @@ from app.schemas.vacancy import (
     VacancyStatusUpdate,
     VacancyUpdate,
 )
+from app.schemas.rubric import RubricOverviewResponse, RubricResponse, RubricUpdateRequest
+from app.services import hh_parser, rubric_service
+from app.services.agency_access import get_agency_candidate, get_agency_vacancy
+from app.utils.file_validation import validate_pdf_file
 from app.utils.name import extract_first_name
-from app.services import hh_parser
 
 router = APIRouter(prefix="/vacancies", tags=["vacancies"])
 internal_router = APIRouter(prefix="/internal", tags=["internal"])
 
 RESUME_MEDIA_DIR = Path(__file__).resolve().parents[2] / "media" / "resumes"
-
-
-def _check_internal_key(x_internal_key: str) -> None:
-    if x_internal_key != get_internal_api_key():
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
 
 @router.post("/", response_model=VacancyResponse, status_code=status.HTTP_201_CREATED)
@@ -59,7 +58,9 @@ async def create_vacancy(
 
 
 @router.post("/parse-hh", response_model=ParseVacancyHHResponse)
+@parse_hh_limit()
 async def parse_vacancy_hh(
+    request: Request,
     body: ParseHHRequest,
     current_user: CurrentUser,
 ) -> ParseVacancyHHResponse:
@@ -76,7 +77,7 @@ async def list_agency_vacancies_internal(
     db: DbSession,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
 ) -> InternalVacancyListResponse:
-    _check_internal_key(x_internal_key)
+    verify_internal_key(x_internal_key)
 
     agency_result = await db.execute(select(Agency).where(Agency.id == agency_id))
     agency = agency_result.scalar_one_or_none()
@@ -117,7 +118,7 @@ async def parse_hh_internal(
     body: ParseHHRequest,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
 ) -> ParseVacancyHHResponse:
-    _check_internal_key(x_internal_key)
+    verify_internal_key(x_internal_key)
     parsed = await hh_parser.parse_vacancy(str(body.hh_url))
     return ParseVacancyHHResponse(**parsed)
 
@@ -130,7 +131,7 @@ async def get_or_create_vacancy_internal(
     db: DbSession,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
 ) -> dict[str, str]:
-    _check_internal_key(x_internal_key)
+    verify_internal_key(x_internal_key)
 
     hh_url = body.get("hh_url")
     agency_id_raw = body.get("agency_id")
@@ -194,19 +195,20 @@ async def create_candidate_internal(
     db: DbSession,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
 ) -> dict[str, str]:
-    _check_internal_key(x_internal_key)
+    verify_internal_key(x_internal_key)
 
     telegram_id = body.get("telegram_id")
-    if not telegram_id:
+    agency_id_raw = body.get("agency_id")
+    if not telegram_id or not agency_id_raw:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="telegram_id is required",
+            detail="telegram_id and agency_id are required",
         )
+    agency_id = UUID(str(agency_id_raw))
 
-    result = await db.execute(
-        select(Candidate).where(Candidate.telegram_id == str(telegram_id))
-    )
-    candidate = result.scalar_one_or_none()
+    agency_result = await db.execute(select(Agency).where(Agency.id == agency_id))
+    if agency_result.scalar_one_or_none() is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agency not found")
 
     full_name = body.get("full_name")
     first_name = body.get("first_name")
@@ -219,19 +221,10 @@ async def create_candidate_internal(
         if not first_name:
             first_name = extract_first_name(full_name)
 
-    if candidate:
-        if full_name:
-            candidate.full_name = full_name
-            candidate.first_name = first_name
-        if body.get("resume_text"):
-            candidate.resume_text = body.get("resume_text")
-        if body.get("hh_url"):
-            candidate.hh_url = body.get("hh_url")
-        await db.commit()
-        await db.refresh(candidate)
-        return {"id": str(candidate.id)}
-
+    # Each bot application gets its own candidate record so a new resume
+    # cannot overwrite names/resumes on previous screenings.
     candidate = Candidate(
+        agency_id=agency_id,
         full_name=full_name,
         first_name=first_name,
         telegram_id=str(telegram_id),
@@ -255,17 +248,8 @@ async def upload_candidate_resume(
     db: DbSession,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
 ) -> ResumeUploadResponse:
-    _check_internal_key(x_internal_key)
-
-    result = await db.execute(
-        select(Candidate).where(Candidate.id == body.candidate_id)
-    )
-    candidate = result.scalar_one_or_none()
-    if candidate is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Candidate not found",
-        )
+    verify_internal_key(x_internal_key)
+    candidate = await get_agency_candidate(db, body.candidate_id, body.agency_id)
 
     filename = (body.filename or "resume.pdf").lower()
     if not filename.endswith(".pdf"):
@@ -288,10 +272,13 @@ async def upload_candidate_resume(
             detail="Empty file",
         )
 
+    # Validate file size and MIME type
+    validate_pdf_file(file_bytes)
+
     RESUME_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-    candidate_id = str(body.candidate_id)
-    file_path_rel = f"/media/resumes/{candidate_id}.pdf"
-    file_path_abs = RESUME_MEDIA_DIR / f"{candidate_id}.pdf"
+    stored_name = f"{body.candidate_id}_{uuid.uuid4().hex[:12]}.pdf"
+    file_path_rel = f"/media/resumes/{stored_name}"
+    file_path_abs = RESUME_MEDIA_DIR / stored_name
 
     with open(file_path_abs, "wb") as f:
         f.write(file_bytes)
@@ -308,7 +295,12 @@ async def list_vacancies(
     current_user: CurrentUser,
     status: str | None = Query(default=None, description="Filter: active, archived, etc."),
 ) -> list[Vacancy]:
-    query = select(Vacancy).where(Vacancy.user_id == current_user.id)
+    # Показываем все вакансии агентства (не только созданные текущим пользователем)
+    query = select(Vacancy).where(
+        Vacancy.user_id.in_(
+            select(User.id).where(User.agency_id == current_user.agency_id)
+        )
+    )
     if status == "archived":
         query = query.where(Vacancy.status == "archived")
     else:
@@ -323,10 +315,13 @@ async def get_vacancy(
     db: DbSession,
     current_user: CurrentUser,
 ) -> Vacancy:
+    # Показываем вакансию, если она принадлежит агентству пользователя
     result = await db.execute(
-        select(Vacancy).where(
+        select(Vacancy)
+        .join(User, Vacancy.user_id == User.id)
+        .where(
             Vacancy.id == vacancy_id,
-            Vacancy.user_id == current_user.id,
+            User.agency_id == current_user.agency_id,
         )
     )
     vacancy = result.scalar_one_or_none()
@@ -343,9 +338,11 @@ async def update_vacancy_status(
     current_user: CurrentUser,
 ) -> Vacancy:
     result = await db.execute(
-        select(Vacancy).where(
+        select(Vacancy)
+        .join(User, Vacancy.user_id == User.id)
+        .where(
             Vacancy.id == vacancy_id,
-            Vacancy.user_id == current_user.id,
+            User.agency_id == current_user.agency_id,
         )
     )
     vacancy = result.scalar_one_or_none()
@@ -366,9 +363,11 @@ async def update_vacancy(
     current_user: CurrentUser,
 ) -> Vacancy:
     result = await db.execute(
-        select(Vacancy).where(
+        select(Vacancy)
+        .join(User, Vacancy.user_id == User.id)
+        .where(
             Vacancy.id == vacancy_id,
-            Vacancy.user_id == current_user.id,
+            User.agency_id == current_user.agency_id,
         )
     )
     vacancy = result.scalar_one_or_none()
@@ -392,9 +391,11 @@ async def archive_vacancy(
     current_user: CurrentUser,
 ) -> Vacancy:
     result = await db.execute(
-        select(Vacancy).where(
+        select(Vacancy)
+        .join(User, Vacancy.user_id == User.id)
+        .where(
             Vacancy.id == vacancy_id,
-            Vacancy.user_id == current_user.id,
+            User.agency_id == current_user.agency_id,
         )
     )
     vacancy = result.scalar_one_or_none()
@@ -414,10 +415,13 @@ async def delete_vacancy(
     db: DbSession,
     current_user: CurrentUser,
 ) -> None:
+    # Все сотрудники агентства могут удалять вакансии (не только admin)
     result = await db.execute(
-        select(Vacancy).where(
+        select(Vacancy)
+        .join(User, Vacancy.user_id == User.id)
+        .where(
             Vacancy.id == vacancy_id,
-            Vacancy.user_id == current_user.id,
+            User.agency_id == current_user.agency_id,
         )
     )
     vacancy = result.scalar_one_or_none()
@@ -434,7 +438,17 @@ async def get_vacancy_stats(
     db: DbSession,
     current_user: CurrentUser,
 ) -> VacancyStatsResponse:
-    await _get_owned_vacancy(db, vacancy_id, current_user)
+    # Проверяем, что вакансия принадлежит агентству пользователя
+    vacancy_check = await db.execute(
+        select(Vacancy)
+        .join(User, Vacancy.user_id == User.id)
+        .where(
+            Vacancy.id == vacancy_id,
+            User.agency_id == current_user.agency_id,
+        )
+    )
+    if vacancy_check.scalar_one_or_none() is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vacancy not found")
 
     result = await db.execute(
         select(Screening.status, func.count())
@@ -453,14 +467,94 @@ async def get_vacancy_stats(
     )
 
 
-async def _get_owned_vacancy(db: DbSession, vacancy_id: UUID, user: CurrentUser) -> Vacancy:
+def _rubric_to_response(rubric: VacancyRubric) -> RubricResponse:
+    from app.utils.json_fields import parse_json_text
+
+    data = parse_json_text(rubric.rubric_json)
+    return RubricResponse(
+        id=rubric.id,
+        vacancy_id=rubric.vacancy_id,
+        version=rubric.version,
+        status=rubric.status,
+        rubric_json=data if isinstance(data, dict) else {},
+        created_by=rubric.created_by,
+        approved_by=rubric.approved_by,
+        created_at=rubric.created_at,
+        approved_at=rubric.approved_at,
+    )
+
+
+@router.get("/{vacancy_id}/rubric", response_model=RubricOverviewResponse)
+async def get_vacancy_rubric(
+    vacancy_id: UUID,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> RubricOverviewResponse:
+    await get_agency_vacancy(db, vacancy_id, current_user.agency_id)
+    draft, approved = await rubric_service.get_rubric_overview(db, vacancy_id)
+    return RubricOverviewResponse(
+        draft=_rubric_to_response(draft) if draft else None,
+        approved=_rubric_to_response(approved) if approved else None,
+    )
+
+
+@router.post("/{vacancy_id}/rubric/generate", response_model=RubricResponse)
+async def generate_vacancy_rubric(
+    vacancy_id: UUID,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> RubricResponse:
+    vacancy = await get_agency_vacancy(db, vacancy_id, current_user.agency_id)
+    rubric = await rubric_service.generate_draft_rubric(
+        db, vacancy=vacancy, user=current_user
+    )
+    return _rubric_to_response(rubric)
+
+
+@router.put("/{vacancy_id}/rubric/{rubric_id}", response_model=RubricResponse)
+async def update_vacancy_rubric(
+    vacancy_id: UUID,
+    rubric_id: UUID,
+    body: RubricUpdateRequest,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> RubricResponse:
+    await get_agency_vacancy(db, vacancy_id, current_user.agency_id)
     result = await db.execute(
-        select(Vacancy).where(
-            Vacancy.id == vacancy_id,
-            Vacancy.user_id == user.id,
+        select(VacancyRubric).where(
+            VacancyRubric.id == rubric_id,
+            VacancyRubric.vacancy_id == vacancy_id,
         )
     )
-    vacancy = result.scalar_one_or_none()
-    if vacancy is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Vacancy not found")
-    return vacancy
+    rubric = result.scalar_one_or_none()
+    if rubric is None:
+        raise HTTPException(status_code=404, detail="Rubric not found")
+    rubric = await rubric_service.update_draft_rubric(
+        db,
+        rubric=rubric,
+        rubric_json=body.rubric_json.model_dump(),
+    )
+    return _rubric_to_response(rubric)
+
+
+@router.post("/{vacancy_id}/rubric/{rubric_id}/approve", response_model=RubricResponse)
+async def approve_vacancy_rubric(
+    vacancy_id: UUID,
+    rubric_id: UUID,
+    db: DbSession,
+    current_user: CurrentUser,
+) -> RubricResponse:
+    await get_agency_vacancy(db, vacancy_id, current_user.agency_id)
+    result = await db.execute(
+        select(VacancyRubric).where(
+            VacancyRubric.id == rubric_id,
+            VacancyRubric.vacancy_id == vacancy_id,
+        )
+    )
+    rubric = result.scalar_one_or_none()
+    if rubric is None:
+        raise HTTPException(status_code=404, detail="Rubric not found")
+    rubric = await rubric_service.approve_rubric(
+        db, rubric=rubric, user=current_user
+    )
+    return _rubric_to_response(rubric)

@@ -6,6 +6,8 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from app.core.config import BACKEND_URL
+from app.core.rbac import UserRole, require_role
 from app.deps import CurrentUser, DbSession
 from app.models import Agency
 from app.schemas.bots import (
@@ -19,8 +21,6 @@ from app.services.bot_worker_client import BotWorkerError, start_bot, stop_bot
 
 router = APIRouter(prefix="/bots", tags=["bots"])
 logger = logging.getLogger(__name__)
-
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
 
 
 def _mask_token(token: str) -> str:
@@ -42,6 +42,7 @@ async def _get_agency(db: DbSession, agency_id: uuid.UUID) -> Agency:
 
 
 @router.get("/token", response_model=BotTokenResponse)
+@require_role(UserRole.ADMIN)
 async def get_agency_bot_token(
     db: DbSession,
     current_user: CurrentUser,
@@ -49,13 +50,11 @@ async def get_agency_bot_token(
     agency = await _get_agency(db, current_user.agency_id)
     if not agency.telegram_bot_token:
         return BotTokenResponse(has_token=False)
-    return BotTokenResponse(
-        has_token=True,
-        masked=_mask_token(agency.telegram_bot_token),
-    )
+    return BotTokenResponse(has_token=True)
 
 
 @router.post("/start", response_model=BotActionResponse)
+@require_role(UserRole.ADMIN)
 async def start_agency_bot(
     body: BotStartRequest,
     db: DbSession,
@@ -98,6 +97,7 @@ async def start_agency_bot(
 
 
 @router.post("/stop", response_model=BotActionResponse)
+@require_role(UserRole.ADMIN)
 async def stop_agency_bot(
     db: DbSession,
     current_user: CurrentUser,

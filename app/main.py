@@ -25,8 +25,11 @@ load_project_env()
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.staticfiles import StaticFiles
-from app.core.config import get_allowed_origins, validate_required_secrets
+from app.core.config import (
+    BOT_WORKER_URL,
+    get_allowed_origins,
+    validate_required_secrets,
+)
 from app.core.rate_limit import SLOWAPI_AVAILABLE, health_limit, limiter
 
 if SLOWAPI_AVAILABLE:
@@ -36,12 +39,12 @@ else:
     RateLimitExceeded = Exception  # type: ignore[misc, assignment]
     SlowAPIMiddleware = None  # type: ignore[misc, assignment]
 from app.database import engine
-from app.routers import auth, bots, candidates, screenings, vacancies
+from app.routers import auth, bots, candidates, notifications, screenings, vacancies, team
+from app.routers.bot_state import internal_router as bot_state_internal_router
 from app.routers.reminders import internal_router as reminders_internal_router
 from app.scheduler import start_scheduler, stop_scheduler
 
 logger = logging.getLogger(__name__)
-BOT_WORKER_URL = os.getenv("BOT_WORKER_URL", "http://127.0.0.1:8001")
 
 
 @asynccontextmanager
@@ -89,6 +92,8 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(team.router)
+app.include_router(notifications.router)
 app.include_router(bots.router)
 app.include_router(vacancies.router)
 app.include_router(vacancies.internal_router)
@@ -96,15 +101,19 @@ app.include_router(candidates.router)
 app.include_router(candidates.internal_router)
 app.include_router(screenings.router)
 app.include_router(screenings.internal_router)
+app.include_router(bot_state_internal_router)
 app.include_router(reminders_internal_router)
 
 MEDIA_DIR = Path(__file__).resolve().parent.parent / "media"
 (MEDIA_DIR / "resumes").mkdir(parents=True, exist_ok=True)
 (MEDIA_DIR / "avatars").mkdir(parents=True, exist_ok=True)
-app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
+(MEDIA_DIR / "user_avatars").mkdir(parents=True, exist_ok=True)
+
+from fastapi.staticfiles import StaticFiles
+app.mount("/media/user_avatars", StaticFiles(directory=str(MEDIA_DIR / "user_avatars")), name="user_avatars")
 
 
 @app.get("/health")
 @health_limit()
 async def health(request: Request) -> dict[str, str]:
-    return {"status": "ok", "bot_worker_url": BOT_WORKER_URL}
+    return {"status": "ok"}

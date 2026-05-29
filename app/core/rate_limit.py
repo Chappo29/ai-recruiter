@@ -80,3 +80,27 @@ def health_limit():
     if not rate_limit_enabled() or limiter is None:
         return _noop_decorator
     return limiter.limit(RATE_LIMIT_HEALTH)
+
+
+def team_limit():
+    if not rate_limit_enabled() or limiter is None:
+        return _noop_decorator
+    from app.core.config import RATE_LIMIT_TEAM
+
+    return limiter.limit(RATE_LIMIT_TEAM)
+
+
+def screenings_limit():
+    if not rate_limit_enabled() or limiter is None:
+        return _noop_decorator
+    from app.core.config import RATE_LIMIT_SCREENINGS
+
+    return limiter.limit(RATE_LIMIT_SCREENINGS)
+
+
+def parse_hh_limit():
+    if not rate_limit_enabled() or limiter is None:
+        return _noop_decorator
+    from app.core.config import RATE_LIMIT_PARSE_HH
+
+    return limiter.limit(RATE_LIMIT_PARSE_HH)

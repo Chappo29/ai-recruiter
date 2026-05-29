@@ -1,6 +1,7 @@
 """Telegram bot conversation handlers for candidate dialog."""
 
 import logging
+import re
 
 import httpx
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -13,8 +14,14 @@ from telegram.ext import (
     filters,
 )
 
-from app.core.config import get_internal_api_key
+from app.core.config import DEFAULT_FEEDBACK_DAYS, MAX_RESUME_SIZE_MB, get_internal_api_key
+from app.utils.file_validation import (
+    ResumeFileTooLargeError,
+    resume_size_limit_message,
+    validate_resume_file_size,
+)
 from bot.vacancy_context import build_vacancy_text
+from bot.session import clear_bot_session, save_bot_session
 from bot.resume_pipeline import (
     ResumeInput,
     _MSG_DOCX_STUB,
@@ -39,11 +46,12 @@ _MSG_WRONG_DOC = (
 
 _MSG_NEED_RESUME = (
     "📄 Отправьте резюме:\n"
-    "• PDF-файл (скачать с hh.ru → «Скачать» → PDF)\n"
+    "• PDF-файл до {max_mb} МБ (скачать с hh.ru → «Скачать» → PDF)\n"
     "• или текстом — ссылка на hh.ru или кратко об опыте"
-)
+).format(max_mb=MAX_RESUME_SIZE_MB)
 
 _MIN_TEXT_RESUME_LEN = 30
+_HH_RESUME_URL_RE = re.compile(r'https?://([\w.]*\.)?hh\.(ru|kz|uz)/resume/\w+', re.I)
 
 
 def _headers() -> dict[str, str]:
@@ -67,7 +75,7 @@ def _vacancy_chosen_message(title: str, company: str | None) -> str:
             "PDF с hh.ru:",
             "1. Зайдите на hh.ru → Моё резюме",
             "2. «Скачать» → PDF",
-            "3. Отправьте файл сюда ⬆️",
+            f"3. Отправьте файл сюда (до {MAX_RESUME_SIZE_MB} МБ) ⬆️",
         ]
     )
     return "\n".join(lines)
@@ -87,7 +95,9 @@ def _final_message(name: str, days: int, *, had_questions: bool) -> str:
     )
 
 
-def build_conversation_handler(agency_id: str, backend_url: str) -> ConversationHandler:
+def build_conversation_handler(
+    agency_id: str, backend_url: str
+) -> tuple[ConversationHandler, object]:
     backend = backend_url.rstrip("/")
 
     async def _api_get(client: httpx.AsyncClient, path: str, **params):
@@ -96,7 +106,27 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
     async def _api_post(client: httpx.AsyncClient, path: str, json: dict):
         return await client.post(f"{backend}{path}", headers=_headers(), json=json)
 
+    async def _persist_session(
+        ctx: ContextTypes.DEFAULT_TYPE,
+        telegram_id: str,
+        *,
+        step: str | None = None,
+    ) -> None:
+        await save_bot_session(
+            backend_url=backend,
+            agency_id=agency_id,
+            telegram_id=telegram_id,
+            user_data=ctx.user_data,
+            step=step,
+        )
+
     async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+        telegram_id = str(update.effective_user.id)
+        await clear_bot_session(
+            backend_url=backend,
+            agency_id=agency_id,
+            telegram_id=telegram_id,
+        )
         ctx.user_data.clear()
         ctx.user_data["agency_id"] = agency_id
         ctx.user_data["backend_url"] = backend
@@ -114,13 +144,15 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
 
         data = response.json()
         vacancies = data.get("vacancies") or []
-        ctx.user_data["feedback_days"] = data.get("feedback_days", 3)
+        ctx.user_data["feedback_days"] = data.get("feedback_days", DEFAULT_FEEDBACK_DAYS)
 
         if not vacancies:
             await update.message.reply_text(
                 "Сейчас нет открытых вакансий. Загляните позже!"
             )
             return ConversationHandler.END
+
+        ctx.user_data["_vacancies"] = vacancies
 
         keyboard = [
             [InlineKeyboardButton(v["title"], callback_data=str(v["id"]))]
@@ -130,6 +162,7 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
             "Привет! 👋 Выберите вакансию, на которую хотите откликнуться:",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
+        await _persist_session(ctx, telegram_id, step="wait_vacancy")
         return WAIT_VACANCY
 
     async def handle_vacancy_choice(
@@ -145,19 +178,30 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
         requirements = None
         description = None
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            vacancies_resp = await _api_get(
-                client, "/internal/vacancies/", agency_id=agency_id
-            )
-            if vacancies_resp.status_code == 200:
-                for v in vacancies_resp.json().get("vacancies") or []:
-                    if str(v["id"]) == vacancy_id:
-                        title = v.get("title") or title
-                        company = v.get("company") or company
-                        requirements = v.get("requirements")
-                        description = v.get("description")
-                        ai_prompt = v.get("ai_screening_prompt")
-                        break
+        cached = ctx.user_data.get("_vacancies")
+        if cached:
+            for v in cached:
+                if str(v["id"]) == vacancy_id:
+                    title = v.get("title") or title
+                    company = v.get("company") or company
+                    requirements = v.get("requirements")
+                    description = v.get("description")
+                    ai_prompt = v.get("ai_screening_prompt")
+                    break
+        else:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                vacancies_resp = await _api_get(
+                    client, "/internal/vacancies/", agency_id=agency_id
+                )
+                if vacancies_resp.status_code == 200:
+                    for v in vacancies_resp.json().get("vacancies") or []:
+                        if str(v["id"]) == vacancy_id:
+                            title = v.get("title") or title
+                            company = v.get("company") or company
+                            requirements = v.get("requirements")
+                            description = v.get("description")
+                            ai_prompt = v.get("ai_screening_prompt")
+                            break
 
         ctx.user_data["vacancy_id"] = vacancy_id
         ctx.user_data["vacancy_title"] = title
@@ -178,6 +222,7 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
             vacancy_title=title,
         )
 
+        await _persist_session(ctx, str(query.from_user.id), step="wait_resume")
         return WAIT_RESUME
 
     async def _create_screening(
@@ -190,6 +235,7 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
                 {
                     "vacancy_id": vacancy_id,
                     "candidate_id": candidate_id,
+                    "agency_id": agency_id,
                     "run_llm": run_llm,
                 },
             )
@@ -230,7 +276,7 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
                 await _api_post(
                     client,
                     "/internal/reminders/cancel",
-                    {"telegram_id": telegram_id},
+                    {"telegram_id": telegram_id, "agency_id": agency_id},
                 )
         except Exception:
             logger.warning(
@@ -268,6 +314,15 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
                 return WAIT_RESUME
 
             doc = message.document
+            if doc.file_size is not None:
+                try:
+                    validate_resume_file_size(doc.file_size)
+                except ResumeFileTooLargeError as exc:
+                    await message.reply_text(
+                        resume_size_limit_message(actual_bytes=exc.size_bytes)
+                    )
+                    return WAIT_RESUME
+
             try:
                 tg_file = await doc.get_file()
                 file_bytes = bytes(await tg_file.download_as_bytearray())
@@ -275,6 +330,14 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
                 logger.exception("PDF download failed")
                 await message.reply_text(
                     "Не удалось скачать файл. Попробуйте ещё раз."
+                )
+                return WAIT_RESUME
+
+            try:
+                validate_resume_file_size(len(file_bytes))
+            except ResumeFileTooLargeError as exc:
+                await message.reply_text(
+                    resume_size_limit_message(actual_bytes=exc.size_bytes)
                 )
                 return WAIT_RESUME
 
@@ -286,22 +349,27 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
 
         elif message.text:
             text = message.text.strip()
-            if len(text) < _MIN_TEXT_RESUME_LEN and "hh.ru" not in text.lower():
+            if _HH_RESUME_URL_RE.search(text):
+                resume_input = ResumeInput(kind="hh_url", resume_text=text)
+            elif len(text) < _MIN_TEXT_RESUME_LEN:
                 await message.reply_text(
-                    "Пожалуйста, отправьте чуть подробнее: ссылку на hh.ru "
+                    "Пожалуйста, отправьте чуть подробнее: ссылку на резюме hh.ru "
                     "или краткое описание опыта (не менее нескольких предложений)."
                 )
                 return WAIT_RESUME
-            resume_input = ResumeInput(kind="text", resume_text=text)
+            else:
+                resume_input = ResumeInput(kind="text", resume_text=text)
 
         else:
             await message.reply_text(_MSG_NEED_RESUME)
             return WAIT_RESUME
 
-        await message.reply_text(_MSG_PROCESSING_ACK)
         ud["processing_resume"] = True
         ud["awaiting_questions"] = False
         ud["conversation_finished"] = False
+        await _persist_session(ctx, str(update.effective_user.id), step="wait_resume")
+
+        await message.reply_text(_MSG_PROCESSING_ACK)
 
         chat_id = update.effective_chat.id
         bot = ctx.application.bot
@@ -310,14 +378,17 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
             await run_resume_pipeline(
                 bot=bot,
                 chat_id=chat_id,
+                telegram_id=str(update.effective_user.id),
                 ctx=ctx,
                 agency_id=agency_id,
                 resume_input=resume_input,
                 api_post=_api_post,
+                api_get=_api_get,
                 create_screening=_create_screening,
                 cancel_reminder=_cancel_reminder,
                 create_reminder=_create_reminder,
                 final_message=_final_message,
+                persist_session=_persist_session,
             )
 
         schedule_resume_pipeline(bot=bot, chat_id=chat_id, ctx=ctx, coro_factory=_pipeline)
@@ -338,17 +409,76 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
             ctx=ctx,
             user_text=answer_text,
             api_post=_api_post,
+            api_get=_api_get,
             final_message=_final_message,
         )
 
         if finished:
             await _cancel_reminder(str(update.effective_user.id))
+            await _persist_session(ctx, str(update.effective_user.id), step="finished")
             return ConversationHandler.END
 
+        await _persist_session(ctx, str(update.effective_user.id), step="interview")
         return ASKING_QUESTIONS
 
-    return ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+    conv: ConversationHandler | None = None
+
+    async def restore_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        from bot.session import conversation_state_for_step, load_bot_session
+
+        if update.message and update.message.text:
+            cmd = update.message.text.strip().split()[0].split("@")[0].lower()
+            if cmd == "/start":
+                return
+
+        ud = ctx.user_data
+        if ud.get("_session_loaded"):
+            return
+
+        ud["_session_loaded"] = True
+        ud.setdefault("agency_id", agency_id)
+        ud.setdefault("backend_url", backend)
+
+        if not update.effective_user:
+            return
+
+        telegram_id = str(update.effective_user.id)
+        stored = await load_bot_session(
+            backend_url=backend,
+            agency_id=agency_id,
+            telegram_id=telegram_id,
+        )
+        if not stored:
+            return
+
+        ud.update(stored.get("user_data") or {})
+        step = stored.get("step") or "wait_vacancy"
+
+        if ud.get("processing_resume"):
+            ud["processing_resume"] = False
+
+        conv_state = conversation_state_for_step(step)
+        if conv is not None and update.effective_chat:
+            key = conv._get_key(update)
+            if key is not None and conv_state is not None:
+                conv._update_state(conv_state, key)
+
+        if step == "interview" and update.message and not ud.get("_restore_notice"):
+            ud["_restore_notice"] = True
+            await update.message.reply_text("Продолжаем 👋")
+
+    async def handle_unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Catch-all for messages outside an active conversation."""
+        if update.message:
+            await update.message.reply_text(
+                "Привет! 👋 Чтобы откликнуться на вакансию, нажмите /start"
+            )
+
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(~filters.COMMAND, handle_unknown),
+        ],
         states={
             WAIT_VACANCY: [
                 CallbackQueryHandler(handle_vacancy_choice, pattern=r"^.+$"),
@@ -362,3 +492,5 @@ def build_conversation_handler(agency_id: str, backend_url: str) -> Conversation
         },
         fallbacks=[CommandHandler("start", start)],
     )
+    conv = conv_handler
+    return conv_handler, restore_session

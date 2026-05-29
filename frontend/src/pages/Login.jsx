@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import client, { API_BASE_URL } from '../api/client'
 
 function Logo() {
@@ -31,7 +31,9 @@ export default function Login() {
     setLoading(true)
     try {
       const { data } = await client.post('/auth/login', { email, password })
-      localStorage.setItem('token', data.access_token)
+      if (data.access_token) {
+        // Cookie is set by server; token in body kept for API clients only.
+      }
       navigate('/dashboard')
     } catch (err) {
       if (!err.response) {
@@ -137,6 +139,12 @@ export default function Login() {
             {loading ? 'Вход…' : 'Войти'}
           </button>
         </form>
+        <p style={{ textAlign: 'center', fontSize: 13, color: '#6B7280', marginTop: 20 }}>
+          Нет аккаунта?{' '}
+          <Link to="/register" style={{ color: '#4F46E5', fontWeight: 500 }}>
+            Зарегистрироваться
+          </Link>
+        </p>
       </div>
     </div>
   )

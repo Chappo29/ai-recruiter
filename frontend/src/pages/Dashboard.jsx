@@ -4,7 +4,7 @@ import { useLocation, useNavigate } from 'react-router-dom'
 
 import { AlertTriangle, Bot, Briefcase, Star, Users } from 'lucide-react'
 
-import client, { API_BASE_URL } from '../api/client'
+import client, { mediaUrl } from '../api/client'
 
 import Avatar from '../components/Avatar'
 
@@ -175,6 +175,61 @@ export default function Dashboard() {
 
 
       <div style={{ padding: 24 }}>
+
+        {!loading && vacancies.length === 0 && recentScreenings.length === 0 && (
+          <div
+            style={{
+              background: '#EEF2FF',
+              borderRadius: 12,
+              padding: 20,
+              marginBottom: 20,
+              border: '1px solid #E0E7FF',
+            }}
+          >
+            <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 12, color: '#3730A3' }}>
+              🚀 С чего начать
+            </div>
+            <ol style={{ fontSize: 13, color: '#374151', paddingLeft: 20, lineHeight: 1.9, margin: 0 }}>
+              <li>
+                <button
+                  type="button"
+                  onClick={() => navigate('/bot')}
+                  style={{
+                    border: 'none',
+                    background: 'transparent',
+                    color: '#4F46E5',
+                    fontSize: 13,
+                    fontWeight: 500,
+                    padding: 0,
+                    cursor: 'pointer',
+                  }}
+                >
+                  Настроить Telegram-бота
+                </button>
+                {' '}— вставьте токен от @BotFather и запустите бота
+              </li>
+              <li>
+                <button
+                  type="button"
+                  onClick={() => navigate('/vacancies')}
+                  style={{
+                    border: 'none',
+                    background: 'transparent',
+                    color: '#4F46E5',
+                    fontSize: 13,
+                    fontWeight: 500,
+                    padding: 0,
+                    cursor: 'pointer',
+                  }}
+                >
+                  Создать вакансию
+                </button>
+                {' '}— добавьте первую вакансию с требованиями
+              </li>
+              <li>Скопируйте ссылку бота (раздел «Бот») и разместите в объявлении</li>
+            </ol>
+          </div>
+        )}
 
         <div
 
@@ -467,9 +522,11 @@ export default function Dashboard() {
                   <Avatar
                     name={name}
                     src={
-                      (s.candidate?.avatar_file_path || s.avatar_file_path)
-                        ? `${API_BASE_URL}${s.candidate?.avatar_file_path || s.avatar_file_path}`
-                        : null
+                    mediaUrl(
+                      s.avatar_url ||
+                        s.candidate?.avatar_file_path ||
+                        s.avatar_file_path
+                    )
                     }
                     size={36}
                   />

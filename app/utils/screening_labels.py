@@ -1,6 +1,7 @@
 from app.models import Screening
 
 STATUS_LABELS = {
+    "scoring": "Оценка...",
     "pending": "На рассмотрении",
     "forwarded": "Передан дальше",
     "rejected": "Отказ",

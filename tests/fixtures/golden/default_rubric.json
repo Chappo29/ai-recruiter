@@ -1,0 +1,41 @@
+{
+  "competencies": [
+    {
+      "id": "hard_skills",
+      "title": "Hard skills",
+      "weight": 0.35,
+      "must_have": true,
+      "levels": { "1": "no", "3": "some", "5": "strong" }
+    },
+    {
+      "id": "experience",
+      "title": "Relevant experience",
+      "weight": 0.25,
+      "must_have": false,
+      "levels": { "1": "no", "3": "some", "5": "strong" }
+    },
+    {
+      "id": "achievements",
+      "title": "Achievements & impact",
+      "weight": 0.2,
+      "must_have": false,
+      "levels": { "1": "none", "3": "some", "5": "strong" }
+    },
+    {
+      "id": "red_flags",
+      "title": "Red flags",
+      "weight": 0.1,
+      "must_have": false,
+      "levels": { "1": "many", "3": "some", "5": "none" }
+    },
+    {
+      "id": "motivation",
+      "title": "Motivation / fit",
+      "weight": 0.1,
+      "must_have": false,
+      "levels": { "1": "unclear", "3": "ok", "5": "strong" }
+    }
+  ],
+  "generated_from": { "source": "golden_default" }
+}
+

@@ -7,11 +7,13 @@ from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, 
 from sqlalchemy import select
 from sqlalchemy.orm import joinedload
 
-from app.core.config import get_internal_api_key
-from app.core.rate_limit import internal_limit
+from app.core.internal_auth import verify_internal_key
+from app.core.rate_limit import internal_limit, screenings_limit
 from app.database import async_session_factory
 from app.deps import CurrentUser, DbSession
-from app.models import Screening, Vacancy
+from app.models import Screening, Vacancy, User, VacancyInterviewQuestion
+from app.schemas.rubric import InterviewQuestionResponse
+from app.services import interview_service
 from app.schemas.screening import (
     SCREENING_STATUSES,
     ScreeningCreate,
@@ -20,6 +22,13 @@ from app.schemas.screening import (
     ScreeningStatusUpdate,
 )
 from app.services import screening_service
+from app.services.agency_access import (
+    agency_vacancy_filter,
+    get_agency_candidate,
+    get_agency_screening,
+    get_agency_vacancy,
+)
+from app.services.ai_audit_service import log_ai_decision
 from app.utils.display_verdict import display_verdict_for
 from app.utils.name import extract_first_name
 from app.utils.screening_response import compute_screening_indices, to_screening_response
@@ -31,14 +40,88 @@ internal_router = APIRouter(prefix="/internal", tags=["internal"])
 logger = logging.getLogger(__name__)
 
 
-def _check_internal_key(x_internal_key: str) -> None:
-    if x_internal_key != get_internal_api_key():
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+async def _notify_new_candidate(db, screening: Screening) -> None:
+    from app.services import notification_service
+
+    vacancy = screening.vacancy
+    candidate = screening.candidate
+    if not vacancy or not vacancy.user_id:
+        return
+    name = (
+        (candidate.full_name or candidate.first_name or "Кандидат")
+        if candidate
+        else "Кандидат"
+    )
+    try:
+        await notification_service.create_notification(
+            db,
+            user_id=vacancy.user_id,
+            type="new_candidate",
+            title="Новый кандидат",
+            message=f"{name} откликнулся на «{vacancy.title}»",
+            action_url=f"/candidates?vacancy_id={str(vacancy.id)}",
+            meta={"screening_id": str(screening.id), "vacancy_id": str(vacancy.id)},
+        )
+    except Exception:
+        logger.exception("Failed to send new_candidate notification for %s", screening.id)
+
+
+async def _notify_screening_done(db, screening_id: UUID) -> None:
+    from app.services import notification_service
+
+    result = await db.execute(
+        select(Screening)
+        .options(
+            joinedload(Screening.candidate),
+            joinedload(Screening.vacancy),
+        )
+        .where(Screening.id == screening_id)
+    )
+    s = result.scalar_one_or_none()
+    if not s or not s.vacancy or not s.vacancy.user_id:
+        return
+    name = (
+        (s.candidate.full_name or s.candidate.first_name or "Кандидат")
+        if s.candidate
+        else "Кандидат"
+    )
+    score_text = f"{s.score}/100" if s.score is not None else "нет данных"
+    try:
+        await notification_service.create_notification(
+            db,
+            user_id=s.vacancy.user_id,
+            type="screening_done",
+            title="Анализ завершён",
+            message=f"{name} — оценка {score_text}",
+            action_url=f"/candidates?vacancy_id={str(s.vacancy_id)}",
+            meta={"screening_id": str(s.id)},
+        )
+    except Exception:
+        logger.exception("Failed to send screening_done notification for %s", screening_id)
+
+
+async def _run_full_rescreen_background(screening_id: UUID) -> None:
+    """Recruiter-triggered reanalysis: resume LLM + immediate finalize.
+    Used by /reanalyze, where there's no live bot interview to combine
+    with — combined score collapses to resume score (or, if interview
+    answers were saved earlier, to the weighted combination)."""
+    async with async_session_factory() as db:
+        try:
+            await screening_service.complete_screening(db, screening_id)
+            await screening_service.finalize_with_interview(db, screening_id)
+            await _notify_screening_done(db, screening_id)
+        except Exception:
+            logger.exception("Background rescreen failed for %s", screening_id)
 
 
 async def _run_screening_background(screening_id: UUID) -> None:
     async with async_session_factory() as db:
         try:
+            # Resume-only LLM run. Status stays "scoring" until the bot calls
+            # /finalize after interview answers (or finalises immediately if
+            # the candidate cannot be interviewed). Recruiter notification is
+            # sent from /finalize, not here, to avoid "Анализ завершён" while
+            # the candidate is still answering questions.
             await screening_service.complete_screening(db, screening_id)
         except Exception:
             logger.exception("Background screening failed for %s", screening_id)
@@ -47,7 +130,11 @@ async def _run_screening_background(screening_id: UUID) -> None:
 async def _load_screening_with_relations(db: DbSession, screening_id: UUID) -> Screening:
     result = await db.execute(
         select(Screening)
-        .options(joinedload(Screening.candidate), joinedload(Screening.vacancy))
+        .options(
+            joinedload(Screening.candidate),
+            joinedload(Screening.vacancy),
+            joinedload(Screening.score_detail),
+        )
         .where(Screening.id == screening_id)
     )
     screening = result.scalar_one_or_none()
@@ -66,7 +153,9 @@ def _to_response(screening: Screening, *, screening_index: int | None = None) ->
 
 
 @router.post("/", response_model=ScreeningResponse, status_code=status.HTTP_201_CREATED)
+@screenings_limit()
 async def start_screening(
+    request: Request,
     body: ScreeningCreate,
     db: DbSession,
     current_user: CurrentUser,
@@ -97,16 +186,18 @@ async def create_screening_internal(
     background_tasks: BackgroundTasks,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
 ) -> ScreeningResponse:
-    _check_internal_key(x_internal_key)
+    verify_internal_key(x_internal_key)
 
+    agency_id_raw = body.get("agency_id")
     vacancy_id_raw = body.get("vacancy_id")
     candidate_id_raw = body.get("candidate_id")
-    if not vacancy_id_raw or not candidate_id_raw:
+    if not agency_id_raw or not vacancy_id_raw or not candidate_id_raw:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="vacancy_id and candidate_id are required",
+            detail="agency_id, vacancy_id and candidate_id are required",
         )
 
+    agency_id = UUID(str(agency_id_raw))
     vacancy_id = (
         vacancy_id_raw if isinstance(vacancy_id_raw, uuid.UUID) else UUID(str(vacancy_id_raw))
     )
@@ -115,6 +206,9 @@ async def create_screening_internal(
         if isinstance(candidate_id_raw, uuid.UUID)
         else UUID(str(candidate_id_raw))
     )
+
+    await get_agency_vacancy(db, vacancy_id, agency_id)
+    await get_agency_candidate(db, candidate_id, agency_id)
 
     run_llm = body.get("run_llm", True)
     if isinstance(run_llm, str):
@@ -128,6 +222,8 @@ async def create_screening_internal(
     if run_llm:
         background_tasks.add_task(_run_screening_background, screening.id)
     screening = await _load_screening_with_relations(db, screening.id)
+    if run_llm:
+        await _notify_new_candidate(db, screening)
     return _to_response(screening)
 
 
@@ -136,10 +232,13 @@ async def create_screening_internal(
 async def complete_screening_internal(
     request: Request,
     screening_id: UUID,
+    agency_id: UUID,
     background_tasks: BackgroundTasks,
+    db: DbSession,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
 ) -> dict[str, str]:
-    _check_internal_key(x_internal_key)
+    verify_internal_key(x_internal_key)
+    await get_agency_screening(db, screening_id, agency_id)
     background_tasks.add_task(_run_screening_background, screening_id)
     return {"status": "queued"}
 
@@ -153,11 +252,122 @@ async def append_screening_dialog_internal(
     db: DbSession,
     x_internal_key: str = Header(..., alias="X-Internal-Key"),
 ) -> dict[str, str]:
-    _check_internal_key(x_internal_key)
+    verify_internal_key(x_internal_key)
+    agency_id_raw = body.get("agency_id")
+    if not agency_id_raw:
+        raise HTTPException(status_code=400, detail="agency_id is required")
+    await get_agency_screening(db, screening_id, UUID(str(agency_id_raw)))
     messages = body.get("messages") or []
     if not isinstance(messages, list):
         raise HTTPException(status_code=400, detail="messages must be a list")
     await screening_service.append_dialog_messages(db, screening_id, messages)
+    return {"status": "ok"}
+
+
+@internal_router.get("/screenings/{screening_id}", response_model=ScreeningResponse)
+@internal_limit()
+async def get_screening_internal(
+    request: Request,
+    screening_id: UUID,
+    agency_id: UUID,
+    db: DbSession,
+    x_internal_key: str = Header(..., alias="X-Internal-Key"),
+) -> ScreeningResponse:
+    verify_internal_key(x_internal_key)
+    await get_agency_screening(db, screening_id, agency_id)
+    screening = await _load_screening_with_relations(db, screening_id)
+    return _to_response(screening)
+
+
+@internal_router.get(
+    "/vacancies/{vacancy_id}/interview-questions",
+    response_model=list[InterviewQuestionResponse],
+)
+@internal_limit()
+async def list_interview_questions_internal(
+    request: Request,
+    vacancy_id: UUID,
+    agency_id: UUID,
+    db: DbSession,
+    x_internal_key: str = Header(..., alias="X-Internal-Key"),
+) -> list[InterviewQuestionResponse]:
+    verify_internal_key(x_internal_key)
+    await get_agency_vacancy(db, vacancy_id, agency_id)
+    questions = await interview_service.list_interview_questions(db, vacancy_id)
+    return [InterviewQuestionResponse.model_validate(q) for q in questions]
+
+
+@internal_router.post(
+    "/vacancies/{vacancy_id}/ensure-interview-questions",
+    response_model=list[InterviewQuestionResponse],
+)
+@internal_limit()
+async def ensure_interview_questions_internal(
+    request: Request,
+    vacancy_id: UUID,
+    body: dict[str, Any],
+    db: DbSession,
+    x_internal_key: str = Header(..., alias="X-Internal-Key"),
+) -> list[InterviewQuestionResponse]:
+    verify_internal_key(x_internal_key)
+    agency_id_raw = body.get("agency_id")
+    if not agency_id_raw:
+        raise HTTPException(status_code=400, detail="agency_id is required")
+    await get_agency_vacancy(db, vacancy_id, UUID(str(agency_id_raw)))
+    questions = await interview_service.ensure_question_bank(db, vacancy_id)
+    return [InterviewQuestionResponse.model_validate(q) for q in questions]
+
+
+@internal_router.post("/screenings/{screening_id}/finalize", response_model=ScreeningResponse)
+@internal_limit()
+async def finalize_screening_internal(
+    request: Request,
+    screening_id: UUID,
+    body: dict[str, Any],
+    db: DbSession,
+    x_internal_key: str = Header(..., alias="X-Internal-Key"),
+) -> ScreeningResponse:
+    verify_internal_key(x_internal_key)
+    agency_id_raw = body.get("agency_id")
+    if not agency_id_raw:
+        raise HTTPException(status_code=400, detail="agency_id is required")
+    agency_id = UUID(str(agency_id_raw))
+    await get_agency_screening(db, screening_id, agency_id)
+    await screening_service.finalize_with_interview(db, screening_id)
+    await _notify_screening_done(db, screening_id)
+    screening = await _load_screening_with_relations(db, screening_id)
+    return _to_response(screening)
+
+
+@internal_router.post("/screenings/{screening_id}/interview-answers")
+@internal_limit()
+async def save_interview_answer_internal(
+    request: Request,
+    screening_id: UUID,
+    body: dict[str, Any],
+    db: DbSession,
+    x_internal_key: str = Header(..., alias="X-Internal-Key"),
+) -> dict[str, str]:
+    verify_internal_key(x_internal_key)
+    agency_id_raw = body.get("agency_id")
+    if not agency_id_raw:
+        raise HTTPException(status_code=400, detail="agency_id is required")
+    agency_id = UUID(str(agency_id_raw))
+    await get_agency_screening(db, screening_id, agency_id)
+
+    question_id_raw = body.get("question_id")
+    answer_text = body.get("answer_text")
+    if not question_id_raw or not answer_text:
+        raise HTTPException(status_code=400, detail="question_id and answer_text required")
+
+    await interview_service.save_interview_answer(
+        db,
+        screening_id=screening_id,
+        question_id=UUID(str(question_id_raw)),
+        answer_text=str(answer_text),
+        score_1_5=body.get("score_1_5"),
+        evidence=body.get("evidence"),
+    )
     return {"status": "ok"}
 
 
@@ -169,7 +379,7 @@ async def get_screening_stats(
     result = await db.execute(
         select(Screening)
         .join(Vacancy, Screening.vacancy_id == Vacancy.id)
-        .where(Vacancy.user_id == current_user.id)
+        .where(agency_vacancy_filter(current_user.agency_id))
     )
     screenings = list(result.scalars().all())
 
@@ -202,7 +412,7 @@ async def list_recent_screenings(
         select(Screening)
         .join(Vacancy, Screening.vacancy_id == Vacancy.id)
         .options(joinedload(Screening.candidate), joinedload(Screening.vacancy))
-        .where(Vacancy.user_id == current_user.id)
+        .where(agency_vacancy_filter(current_user.agency_id))
         .order_by(Screening.created_at.desc())
         .limit(capped * 10)
     )
@@ -235,14 +445,18 @@ async def rerun_screening_llm(
         .options(joinedload(Screening.candidate), joinedload(Screening.vacancy))
         .where(
             Screening.id == screening_id,
-            Vacancy.user_id == current_user.id,
+            agency_vacancy_filter(current_user.agency_id),
         )
     )
     screening = result.scalar_one_or_none()
     if screening is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Screening not found")
 
-    background_tasks.add_task(_run_screening_background, screening.id)
+    screening.score = None
+    screening.summary = None
+    screening.status = "scoring"
+    await db.commit()
+    background_tasks.add_task(_run_full_rescreen_background, screening.id)
     screening = await _load_screening_with_relations(db, screening.id)
     return _to_response(screening)
 
@@ -253,12 +467,16 @@ async def list_screenings_for_vacancy(
     db: DbSession,
     current_user: CurrentUser,
 ) -> list[ScreeningResponse]:
-    await screening_service.get_user_vacancy(db, vacancy_id, current_user)
+    await screening_service.get_agency_vacancy(db, vacancy_id, current_user)
 
     result = await db.execute(
         select(Screening)
         .where(Screening.vacancy_id == vacancy_id)
-        .options(joinedload(Screening.candidate), joinedload(Screening.vacancy))
+        .options(
+            joinedload(Screening.candidate),
+            joinedload(Screening.vacancy),
+            joinedload(Screening.score_detail),
+        )
         .order_by(Screening.created_at.desc())
     )
     screenings = list(result.scalars().unique().all())
@@ -281,7 +499,7 @@ async def list_candidate_screening_history(
         .options(joinedload(Screening.candidate), joinedload(Screening.vacancy))
         .where(
             Screening.candidate_id == candidate_id,
-            Vacancy.user_id == current_user.id,
+            agency_vacancy_filter(current_user.agency_id),
         )
         .order_by(Screening.created_at.desc())
     )
@@ -305,7 +523,7 @@ async def reject_screening(
         .options(joinedload(Screening.candidate), joinedload(Screening.vacancy))
         .where(
             Screening.id == screening_id,
-            Vacancy.user_id == current_user.id,
+            agency_vacancy_filter(current_user.agency_id),
         )
     )
     screening = result.scalar_one_or_none()
@@ -348,6 +566,18 @@ async def reject_screening(
         ) from exc
 
     screening.status = "rejected"
+    await log_ai_decision(
+        db,
+        screening_id=screening.id,
+        agency_id=current_user.agency_id,
+        decision_type="reject",
+        actor_type="human",
+        actor_id=current_user.id,
+        ai_score=screening.score,
+        ai_verdict=screening.verdict,
+        human_override=True,
+        reasoning={"source": "recruiter_reject_with_telegram"},
+    )
     await db.commit()
     screening = await _load_screening_with_relations(db, screening.id)
     return _to_response(screening)
@@ -365,7 +595,7 @@ async def get_screening(
         .options(joinedload(Screening.candidate), joinedload(Screening.vacancy))
         .where(
             Screening.id == screening_id,
-            Vacancy.user_id == current_user.id,
+            agency_vacancy_filter(current_user.agency_id),
         )
     )
     screening = result.scalar_one_or_none()
@@ -387,7 +617,7 @@ async def reanalyze_screening(
         .options(joinedload(Screening.candidate), joinedload(Screening.vacancy))
         .where(
             Screening.id == screening_id,
-            Vacancy.user_id == current_user.id,
+            agency_vacancy_filter(current_user.agency_id),
         )
     )
     screening = result.scalar_one_or_none()
@@ -396,9 +626,10 @@ async def reanalyze_screening(
 
     screening.summary = None
     screening.score = None
+    screening.status = "scoring"
     await db.commit()
 
-    background_tasks.add_task(_run_screening_background, screening_id)
+    background_tasks.add_task(_run_full_rescreen_background, screening_id)
     screening = await _load_screening_with_relations(db, screening_id)
     return _to_response(screening)
 
@@ -419,7 +650,7 @@ async def update_screening_status(
         .options(joinedload(Screening.candidate), joinedload(Screening.vacancy))
         .where(
             Screening.id == screening_id,
-            Vacancy.user_id == current_user.id,
+            agency_vacancy_filter(current_user.agency_id),
         )
     )
     screening = result.scalar_one_or_none()
@@ -427,6 +658,19 @@ async def update_screening_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Screening not found")
 
     screening.status = body.status
+    if body.status in ("rejected", "forwarded"):
+        await log_ai_decision(
+            db,
+            screening_id=screening.id,
+            agency_id=current_user.agency_id,
+            decision_type=body.status,
+            actor_type="human",
+            actor_id=current_user.id,
+            ai_score=screening.score,
+            ai_verdict=screening.verdict,
+            human_override=True,
+            reasoning={"source": "recruiter_status_update"},
+        )
     await db.commit()
     screening = await _load_screening_with_relations(db, screening.id)
     return _to_response(screening)

@@ -7,6 +7,7 @@ function screeningAgeMs(screening) {
 
 /** ИИ ещё анализирует резюме (недавно создан, нет score и summary). */
 export function isAiAnalysisPending(screening) {
+  if (screening?.status === 'scoring') return true
   if (screening?.score != null) return false
   if ((screening?.summary || '').trim()) return false
   return screeningAgeMs(screening) < ANALYSIS_WAIT_MS
